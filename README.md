@@ -35,10 +35,12 @@ The stable boundary is `PipelineGraph`, not DataFusion. A frontend adapter owns
 plan inspection and replacement. QuillSQL owns the neutral pipeline model, MLIR
 lowering, Arrow runtime, and compiled execution path.
 
-Operator fusion is designed to happen in MLIR lowering passes. `PipelineGraph`
-keeps semantic operators such as `filter`, `project`, `plain_sum`, and
-`group_aggregate`; the lowering layer turns supported shapes into fused loops.
-That keeps the system extensible without adding query-specific fused operators.
+Operator semantics live in `quill-plan`; fusion policy lives in
+`quill-jit`. `PipelineGraph` keeps semantic operators such as `filter`,
+`project`, `plain_sum`, and `group_aggregate`; the `quill-jit` fusion registry
+selects supported fragments, and MLIR lowering turns those fragments into fused
+loops. That keeps frontend adapters thin and avoids query-specific fused
+operators.
 
 ## Packages
 
@@ -47,8 +49,8 @@ That keeps the system extensible without adding query-specific fused operators.
 | `quill-sql` | CLI, server, benchmarks, and release metadata. |
 | `quill-core` | Public `Database` API and DataFusion-backed shell integration. |
 | `quill-df` | Default DataFusion frontend adapter and `CompiledPipelineExec`. |
-| `quill-plan` | Frontend-neutral `PipelineGraph`, expressions, types, stages, and sinks. |
-| `quill-jit` | JIT orchestration, frontend adapter trait, dialect emission, and MLIR backend. |
+| `quill-plan` | Frontend-neutral `PipelineGraph`, expressions, types, operators, stages, and sinks. |
+| `quill-jit` | Fusion registry, JIT orchestration, frontend adapter trait, dialect emission, and MLIR backend. |
 | `quill-runtime` | Arrow binding, safety checks, fixed-width kernels, and result materialization. |
 | `quill-mlir` | C++/TableGen MLIR dialect and lowering pass package. |
 
@@ -60,9 +62,9 @@ pass registration live in `quill-mlir` because those are native MLIR C++ API
 surfaces. Rust calls into that package through `melior`.
 
 Current compiled coverage is intentionally narrow: fixed-width
-`filter -> project -> record_batch`, `f64 filter -> SUM`, and Q6-shaped
-`Date32`/`Decimal128 filter -> SUM`. Unsupported expressions or unsafe Arrow
-layouts stay on the safe Rust runtime or DataFusion path.
+`filter -> project -> record_batch` and fixed-width `filter -> SUM`, including
+the Q6-style `Date32`/`Decimal128` case. Unsupported expressions or unsafe
+Arrow layouts stay on the safe Rust runtime or DataFusion path.
 
 ## Quick Start
 

@@ -1,7 +1,7 @@
 use crate::{JitExpr, JitProjection, JitType};
 use serde::Serialize;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipelineSource {
     ArrowBatch,
     ArrowStream,
@@ -16,11 +16,154 @@ impl PipelineSource {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorKind {
+    Source,
+    Filter,
+    Project,
+    Limit,
+    PlainAggregate,
+    GroupAggregate,
+    HashJoin,
+    TopK,
+    Sort,
+    Exchange,
+    RecordBatchSink,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputMode {
+    RecordBatch,
+    Selection,
+    Scalar,
+    Grouped,
+    Stream,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperatorProperties {
+    pub preserves_order: bool,
+    pub changes_cardinality: bool,
+    pub pipeline_breaker: bool,
+    pub requires_state: bool,
+    pub output_mode: OutputMode,
+}
+
+impl OperatorKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Filter => "filter",
+            Self::Project => "project",
+            Self::Limit => "limit",
+            Self::PlainAggregate => "plain_aggregate",
+            Self::GroupAggregate => "group_aggregate",
+            Self::HashJoin => "hash_join",
+            Self::TopK => "topk",
+            Self::Sort => "sort",
+            Self::Exchange => "exchange",
+            Self::RecordBatchSink => "record_batch",
+        }
+    }
+
+    pub fn properties(self) -> OperatorProperties {
+        match self {
+            Self::Source => OperatorProperties {
+                preserves_order: true,
+                changes_cardinality: false,
+                pipeline_breaker: false,
+                requires_state: false,
+                output_mode: OutputMode::Stream,
+            },
+            Self::Filter => OperatorProperties {
+                preserves_order: true,
+                changes_cardinality: true,
+                pipeline_breaker: false,
+                requires_state: false,
+                output_mode: OutputMode::Selection,
+            },
+            Self::Project => OperatorProperties {
+                preserves_order: true,
+                changes_cardinality: false,
+                pipeline_breaker: false,
+                requires_state: false,
+                output_mode: OutputMode::RecordBatch,
+            },
+            Self::Limit => OperatorProperties {
+                preserves_order: true,
+                changes_cardinality: true,
+                pipeline_breaker: false,
+                requires_state: true,
+                output_mode: OutputMode::RecordBatch,
+            },
+            Self::PlainAggregate => OperatorProperties {
+                preserves_order: false,
+                changes_cardinality: true,
+                pipeline_breaker: true,
+                requires_state: true,
+                output_mode: OutputMode::Scalar,
+            },
+            Self::GroupAggregate => OperatorProperties {
+                preserves_order: false,
+                changes_cardinality: true,
+                pipeline_breaker: true,
+                requires_state: true,
+                output_mode: OutputMode::Grouped,
+            },
+            Self::HashJoin => OperatorProperties {
+                preserves_order: false,
+                changes_cardinality: true,
+                pipeline_breaker: true,
+                requires_state: true,
+                output_mode: OutputMode::RecordBatch,
+            },
+            Self::TopK => OperatorProperties {
+                preserves_order: true,
+                changes_cardinality: true,
+                pipeline_breaker: true,
+                requires_state: true,
+                output_mode: OutputMode::RecordBatch,
+            },
+            Self::Sort => OperatorProperties {
+                preserves_order: false,
+                changes_cardinality: false,
+                pipeline_breaker: true,
+                requires_state: true,
+                output_mode: OutputMode::RecordBatch,
+            },
+            Self::Exchange => OperatorProperties {
+                preserves_order: false,
+                changes_cardinality: false,
+                pipeline_breaker: true,
+                requires_state: true,
+                output_mode: OutputMode::Stream,
+            },
+            Self::RecordBatchSink => OperatorProperties {
+                preserves_order: true,
+                changes_cardinality: false,
+                pipeline_breaker: false,
+                requires_state: false,
+                output_mode: OutputMode::RecordBatch,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PipelineStage {
     Filter(JitExpr),
     Projection(Vec<JitProjection>),
     Limit(usize),
+}
+
+impl PipelineStage {
+    pub fn operator_kind(&self) -> OperatorKind {
+        match self {
+            Self::Filter(_) => OperatorKind::Filter,
+            Self::Projection(_) => OperatorKind::Project,
+            Self::Limit(_) => OperatorKind::Limit,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -33,6 +176,16 @@ pub enum PipelineSink {
         keys: Vec<JitExpr>,
         aggregates: Vec<GroupAggregate>,
     },
+}
+
+impl PipelineSink {
+    pub fn operator_kind(&self) -> OperatorKind {
+        match self {
+            Self::RecordBatch => OperatorKind::RecordBatchSink,
+            Self::Sum { .. } => OperatorKind::PlainAggregate,
+            Self::GroupAggregate { .. } => OperatorKind::GroupAggregate,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -123,11 +276,7 @@ impl PipelineGraph {
     pub fn stage_names(&self) -> Vec<&'static str> {
         self.stages
             .iter()
-            .map(|stage| match stage {
-                PipelineStage::Filter(_) => "filter",
-                PipelineStage::Projection(_) => "project",
-                PipelineStage::Limit(_) => "limit",
-            })
+            .map(|stage| stage.operator_kind().name())
             .collect()
     }
 
@@ -143,7 +292,8 @@ impl PipelineGraph {
 #[cfg(test)]
 mod tests {
     use crate::{
-        AggregateFunc, GroupAggregate, JitExpr, JitProjection, JitScalar, JitType, PipelineGraph,
+        AggregateFunc, GroupAggregate, JitExpr, JitProjection, JitScalar, JitType, OperatorKind,
+        OutputMode, PipelineGraph,
     };
 
     #[test]
@@ -193,5 +343,19 @@ mod tests {
 
         assert!(pipeline.stage_names().is_empty());
         assert_eq!(pipeline.sink_name(), "group_aggregate");
+    }
+
+    #[test]
+    fn describes_operator_properties() {
+        let filter = OperatorKind::Filter.properties();
+        assert!(filter.preserves_order);
+        assert!(filter.changes_cardinality);
+        assert!(!filter.pipeline_breaker);
+        assert_eq!(filter.output_mode, OutputMode::Selection);
+
+        let aggregate = OperatorKind::PlainAggregate.properties();
+        assert!(aggregate.pipeline_breaker);
+        assert!(aggregate.requires_state);
+        assert_eq!(aggregate.output_mode, OutputMode::Scalar);
     }
 }

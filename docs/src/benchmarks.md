@@ -13,7 +13,7 @@ The current code has a real `CompiledPipelineExec` node in the DataFusion hot
 path for both record and scalar-sum pipelines, and its execution body uses
 QuillSQL's fixed-width Arrow batch kernels. With `QUILL_JIT=mlir`, the
 multi-column fixed-width record pipeline and the f64 and
-Q6-shaped decimal filter/sum paths can dispatch to executable MLIR kernels for
+TPC-H Q6-style decimal filter/sum paths can dispatch to executable MLIR kernels for
 null-free, offset-free fixed-width batches. Other compiled MLIR kernel speedups
 are intentionally not claimed as end-to-end query speedups yet.
 
@@ -35,11 +35,11 @@ Benchmarks:
 | `compile/mlir_i64_filter` | MLIR parse/lower/JIT cost for the first compiled fixed-width filter kernel. |
 | `compile/mlir_record_pipeline` | MLIR parse/lower/JIT cost for the fixed-width record pipeline. |
 | `compile/mlir_f64_plain_sum` | MLIR parse/lower/JIT cost for the first compiled fixed-width plain SUM kernel. |
-| `compile/mlir_decimal_plain_sum` | MLIR parse/lower/JIT cost for the Q6-shaped fixed-width `Date32`/`Decimal128` plain SUM kernel. |
+| `compile/mlir_decimal_plain_sum` | MLIR parse/lower/JIT cost for a fixed-width `Date32`/`Decimal128` plain SUM kernel. |
 | `kernel/i64_filter_64k` | Compiled MLIR i64 filter execution over a 64K-row values vector, writing a byte selection mask. |
 | `kernel/record_pipeline_64k` | Compiled MLIR record pipeline execution over 64K rows, compacting projected fixed-width columns. |
 | `kernel/f64_plain_sum_64k` | Compiled MLIR f64 filter/plain-SUM execution over 64K rows. |
-| `kernel/decimal_plain_sum_64k` | Compiled MLIR Q6-shaped decimal filter/plain-SUM execution over 64K fixed-width column slices. |
+| `kernel/decimal_plain_sum_64k` | Compiled MLIR decimal filter/plain-SUM execution over 64K fixed-width column slices. |
 | `pipeline/record_filter_project_64k` | Direct fixed-width Arrow record pipeline execution outside DataFusion planning. |
 | `pipeline/scalar_sum_64k` | Direct fixed-width Arrow scalar-sum pipeline execution outside DataFusion planning. |
 | `sql/df/filter_project_64k` | DataFusion SQL planning/execution over a 64K-row in-memory Arrow table, including `CompiledPipelineExec` when the pattern matches. |

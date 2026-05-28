@@ -78,6 +78,11 @@ QuillSQL keeps one semantic pipeline graph plus an explicit lowering boundary:
   including the first `filter -> plain SUM` sink shape used as the stepping
   stone toward whole-pipeline lowering. It describes the executable subgraph
   selected for compilation; it is not a replacement SQL plan.
+- `OperatorKind` and `OperatorProperties`: frontend-neutral operator metadata
+  such as cardinality behavior, state requirements, and pipeline-breaker status.
+  This stays in `quill-plan` because it describes semantics, not backend policy.
+- `FusionRegistry`: the `quill-jit` registry that matches supported operator
+  fragments against backend-oriented constraints and chooses a lowering shape.
 - `QuillDialectModule`: a formal Quill MLIR graph with `quill.source`,
   `quill.exec`, `quill.sink`, `quill.column`, and `quill.yield` operations.
   `filter`, `project`, `plain_sum`, and the grouped aggregate sink carry scalar
@@ -86,18 +91,17 @@ QuillSQL keeps one semantic pipeline graph plus an explicit lowering boundary:
   `!quill.batch`, `!quill.selection`, `!quill.row`, `!quill.scalar`, ODS
   verifiers, and the registered pass names `quill-canonicalize-pipeline` and
   `convert-quill-to-loops`.
-- `PipelineLowering`: an exact pattern match from `PipelineGraph` to an executable
-  record or aggregate kernel shape.
+- `PipelineLowering`: the result selected by the fusion registry, mapping a
+  semantic graph fragment to an executable record or aggregate kernel shape.
 
 The first fusion patterns are deliberately small:
 
 ```text
 Filter -> Projection
-  => PipelineLowering::Record
+  => filter_project_record => PipelineLowering::Record
 
-Filter -> SUM(f64 expression)
-Filter(Date32/Decimal128 comparisons) -> SUM(Decimal128 * Decimal128)
-  => CompiledPipelineExec(kind=aggregate, sink=scalar_sum)
+Filter -> SUM(fixed-width expression)
+  => filter_plain_sum => CompiledPipelineExec(kind=aggregate, sink=scalar_sum)
 
 Group keys + SUM/COUNT/MIN/MAX aggregate inputs
   => quill.sink.group_aggregate dialect skeleton
@@ -114,9 +118,9 @@ so future
 whole-pipeline lowering does not rely on string plan inspection. This lets the
 project measure real operator boundaries before taking on executable grouped
 aggregates, joins, hash repartitioning, or whole-query pipeline lowering. The
-decimal path now has both a DataFusion-safe fixed-width Arrow runtime
-specialization and an executable MLIR dispatch path for the same fixed-width
-column layout, using the same Q6-shaped decimal `PipelineSpec`. The grouped
+plain aggregate path now has both a DataFusion-safe fixed-width Arrow runtime
+and an executable MLIR dispatch path for the same fixed-width column layout,
+using the same `PlainSum` `PipelineSpec`. The grouped
 aggregate graph and dialect op are present as the Q1 extension point, but the
 optimizer rule still leaves Q1 on DataFusion until the hash aggregate lowering
 is implemented.
@@ -133,6 +137,6 @@ frontend physical plan
 
 The current executable compiled kernels now share that route for the covered
 fixed-width cases: multi-column record projection, `f64 filter/sum`, and the
-Q6-shaped decimal `filter -> plain SUM` path. The remaining work is broadening
+TPC-H Q6-style decimal `filter -> plain SUM` path. The remaining work is broadening
 the dialect operations and lowering rules rather than adding more direct runtime
 shortcuts.

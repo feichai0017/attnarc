@@ -10,7 +10,7 @@ CLI, server, tests, and benchmarks.
 | ------- | ---- |
 | `quill-sql` | CLI/server binaries, benchmarks, and release metadata. |
 | `quill-core` | Public `Database` API, query execution wrapper, Parquet registration, and debug traces. |
-| `quill-plan` | Frontend-neutral `PipelineGraph`, expression, type, source, stage, and sink model. |
+| `quill-plan` | Frontend-neutral `PipelineGraph`, expression, type, operator, source, stage, and sink model. |
 | `quill-runtime` | Arrow batch binding, fixed-width kernels, aggregate state, and result materialization. |
 | `quill-jit` | Compiler orchestration, frontend adapter trait, Quill dialect emission, and MLIR lowering. |
 | `quill-df` | DataFusion frontend adapter, physical optimizer rule, and `CompiledPipelineExec`. |
@@ -37,15 +37,19 @@ Parquet dataset as a DataFusion table.
 | `quill-runtime` | DataFusion-free Arrow runtime kernels and pipeline specs. |
 | `quill-df` | DataFusion expression lowering, pipeline extraction, optimizer rule, and execution wrapper. |
 | `quill-jit/src/dialect` | Quill pipeline dialect text model used as the explicit lowering boundary. |
-| `quill-jit/src/lower` | Exact graph pattern lowering and JIT options. |
+| `quill-jit/src/fusion/` | Fusion pattern registry and graph-to-lowering selection. |
+| `quill-jit/src/options.rs` | JIT mode selection. |
 | `quill-jit/src/mlir` | MLIR emission, formal Quill dialect verification, and compiled ExecutionEngine invocation. |
 
 The JIT subdirectories have stricter internal boundaries:
 
 - `quill-df/src/expr.rs`: lowers supported DataFusion physical expressions into
   the neutral JIT expression model.
-- `quill-plan/src/graph.rs`: defines the semantic `PipelineGraph` shape extracted
-  from frontend physical plans.
+- `quill-plan/src/graph.rs`: defines semantic operators, operator properties,
+  and the `PipelineGraph` shape extracted from frontend physical plans.
+- `quill-jit/src/fusion/`: owns operator fusion patterns such as
+  `filter_project_record` and `filter_plain_sum`; adapters feed it graphs
+  instead of deciding backend strategy themselves.
 - `quill-df/src/extract.rs`: extracts recognizable physical-plan pipelines such as
   `filter -> projection` and `filter -> plain SUM`.
 - `quill-df/src/rule.rs`: physical optimizer rule that delegates supported pipeline
@@ -54,7 +58,7 @@ The JIT subdirectories have stricter internal boundaries:
   execution nodes.
 - `quill-jit/src/mlir/mod.rs`: public backend surface and `KernelBackend` implementation.
 - `quill-jit/src/mlir/lower.rs`: lowers supported Quill dialect modules to executable MLIR;
-  currently covers the Q6-shaped decimal filter/sum path.
+  currently covers record pipelines and fixed-width plain `SUM`.
 - `quill-jit/src/mlir/emit.rs`: textual MLIR emission helpers for QuillSQL JIT expressions
   and fixed-width kernels.
 - `quill-jit/src/mlir/verify.rs`: MLIR parser/verifier setup.
@@ -64,8 +68,7 @@ The JIT subdirectories have stricter internal boundaries:
 - `quill-runtime/src/kernel.rs`: `PipelineSpec` and compiled pipeline
   metadata.
 - `quill-runtime/src/record.rs`: fixed-width filter/project record-batch runtime.
-- `quill-runtime/src/sum.rs`: fixed-width plain `SUM` runtime and Q6-shaped decimal
-  filter/sum specialization.
+- `quill-runtime/src/sum.rs`: fixed-width plain `SUM` runtime.
 - `quill-runtime/src/array.rs`: Arrow array views and output builders.
 - `quill-runtime/src/eval.rs`: expression evaluation and SQL boolean/null semantics.
 - `quill-runtime/src/value.rs`: scalar value representation.
