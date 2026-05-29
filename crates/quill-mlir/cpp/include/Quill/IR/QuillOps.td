@@ -114,7 +114,8 @@ def Quill_PlainSumSinkOp
 def Quill_GroupAggregateSinkOp
     : Quill_Op<"sink.group_aggregate", [SingleBlock]> {
   let summary = "consume selected rows into grouped aggregate state";
-  let arguments = (ins Quill_Batch:$batch, Quill_Selection:$selection);
+  let arguments = (ins Quill_Batch:$batch, Quill_Selection:$selection,
+                   I64Attr:$key_count);
   let regions = (region SizedRegion<1>:$state);
   let results = (outs Quill_Batch:$result);
   let hasVerifier = 1;

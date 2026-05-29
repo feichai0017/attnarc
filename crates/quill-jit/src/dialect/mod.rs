@@ -186,6 +186,16 @@ impl QuillDialectModule {
                 [QuillDialectOp::Filter { predicate }],
                 QuillDialectSink::PlainSum { measure },
             ) => PipelineSpec::filter_sum(predicate, measure),
+            (
+                QuillDialectSource::ArrowBatch,
+                [],
+                QuillDialectSink::GroupAggregate { keys, aggregates },
+            ) => PipelineSpec::group_aggregate(None, keys, aggregates),
+            (
+                QuillDialectSource::ArrowBatch,
+                [QuillDialectOp::Filter { predicate }],
+                QuillDialectSink::GroupAggregate { keys, aggregates },
+            ) => PipelineSpec::group_aggregate(Some(predicate), keys, aggregates),
             _ => None,
         }
     }
@@ -331,7 +341,8 @@ fn append_group_aggregate(
     append_region_values(text, &emitter, &values)?;
     let _ = writeln!(
         text,
-        "    }} : !quill.batch, !quill.selection -> !quill.batch"
+        "    }} {{ key_count = {} : i64 }} : !quill.batch, !quill.selection -> !quill.batch",
+        keys.len()
     );
     Ok(())
 }
@@ -804,8 +815,14 @@ mod tests {
         let text = module.to_mlir_text().unwrap();
 
         assert_eq!(module.kind, PipelineKind::Aggregate);
+        assert_eq!(
+            module.pipeline_spec().map(|spec| spec.name()),
+            Some("group_aggregate")
+        );
         assert!(text.contains("quill.sink.group_aggregate"));
         assert!(text.contains("// qjit.group_funcs = sum"));
+        assert!(text.contains("// qjit.pipeline = group_aggregate"));
+        assert!(text.contains("key_count = 1 : i64"));
         assert!(text.contains("quill.yield"));
     }
 

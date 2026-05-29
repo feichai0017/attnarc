@@ -133,6 +133,35 @@ fn verifies_formal_group_aggregate_dialect_pipeline() {
 }
 
 #[test]
+fn verifies_formal_group_aggregate_with_utf8_key() {
+    let key = JitExpr::Column {
+        index: 0,
+        name: "returnflag".to_string(),
+        ty: JitType::Utf8,
+        nullable: false,
+    };
+    let aggregate = GroupAggregate::new(
+        AggregateFunc::Sum,
+        JitExpr::Column {
+            index: 1,
+            name: "measure".to_string(),
+            ty: JitType::Float64,
+            nullable: false,
+        },
+        JitType::Float64,
+        "sum_measure",
+    );
+    let pipeline = PipelineGraph::group_aggregate(vec![], vec![key], vec![aggregate]);
+    let module = MlirBackend::new()
+        .lower_graph_to_quill_mlir("group_utf8_key_region", &pipeline)
+        .unwrap();
+
+    assert!(module.text.contains("key_count = 1 : i64"));
+    assert!(module.text.contains("!quill.scalar"));
+    MlirBackend::new().verify_module(&module).unwrap();
+}
+
+#[test]
 fn rejects_invalid_quill_filter_region_result() {
     let text = r#"
 module {
@@ -172,7 +201,7 @@ module {
     ^bb0(%row: !quill.row):
       %k = quill.column %row { index = 0 : i64 } : !quill.row -> i64
       quill.yield %k : i64
-    } : !quill.batch, !quill.selection -> !quill.batch
+    } { key_count = 1 : i64 } : !quill.batch, !quill.selection -> !quill.batch
     return
   }
 }

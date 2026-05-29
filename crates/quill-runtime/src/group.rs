@@ -25,7 +25,20 @@ pub struct GroupAggregateKernel {
 
 #[derive(Debug, Clone)]
 pub struct GroupAggregateState {
-    groups: BTreeMap<GroupKey, Vec<AggregateState>>,
+    group_ids: BTreeMap<GroupKey, usize>,
+    groups: Vec<GroupState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupAggregateBatchBinding {
+    group_ids: Vec<i64>,
+    selected_rows: usize,
+}
+
+#[derive(Debug, Clone)]
+struct GroupState {
+    key: GroupKey,
+    aggregates: Vec<AggregateState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -141,8 +154,40 @@ impl GroupAggregateKernel {
 
     pub fn new_state(&self) -> GroupAggregateState {
         GroupAggregateState {
-            groups: BTreeMap::new(),
+            group_ids: BTreeMap::new(),
+            groups: Vec::new(),
         }
+    }
+
+    pub fn bind_batch(
+        &self,
+        state: &mut GroupAggregateState,
+        batch: &RecordBatch,
+    ) -> JitResult<GroupAggregateBatchBinding> {
+        let view = BatchView::try_new(batch)?;
+        let mut group_ids = Vec::with_capacity(batch.num_rows());
+        let mut selected_rows = 0_usize;
+
+        for row in 0..batch.num_rows() {
+            if let Some(predicate) = &self.predicate {
+                if !eval_expr(predicate, &view, row)?.is_filter_true()? {
+                    group_ids.push(-1);
+                    continue;
+                }
+            }
+
+            let key = self.eval_key(&view, row)?;
+            let group_id = state.group_id(key, &self.aggregates);
+            let group_id = i64::try_from(group_id)
+                .map_err(|_| JitError::Backend("group id does not fit in i64".to_string()))?;
+            group_ids.push(group_id);
+            selected_rows += 1;
+        }
+
+        Ok(GroupAggregateBatchBinding {
+            group_ids,
+            selected_rows,
+        })
     }
 
     pub fn accumulate(
@@ -151,19 +196,14 @@ impl GroupAggregateKernel {
         batch: &RecordBatch,
     ) -> JitResult<()> {
         let view = BatchView::try_new(batch)?;
-        for row in 0..batch.num_rows() {
-            if let Some(predicate) = &self.predicate {
-                if !eval_expr(predicate, &view, row)?.is_filter_true()? {
-                    continue;
-                }
+        let binding = self.bind_batch(state, batch)?;
+        for (row, group_id) in binding.group_ids.iter().copied().enumerate() {
+            if group_id < 0 {
+                continue;
             }
-            let key = self.eval_key(&view, row)?;
-            let aggregates = state.groups.entry(key).or_insert_with(|| {
-                self.aggregates
-                    .iter()
-                    .map(AggregateState::empty)
-                    .collect::<Vec<_>>()
-            });
+            let group_id = usize::try_from(group_id)
+                .map_err(|_| JitError::Backend("negative group id".to_string()))?;
+            let aggregates = &mut state.groups[group_id].aggregates;
             for (aggregate, aggregate_state) in self.aggregates.iter().zip(aggregates) {
                 let value = eval_expr(&aggregate.expr, &view, row)?;
                 aggregate_state.update(aggregate.func, value)?;
@@ -180,12 +220,12 @@ impl GroupAggregateKernel {
             .map(|field| OutputBuilder::with_arrow_type(field.data_type(), state.groups.len()))
             .collect::<JitResult<Vec<_>>>()?;
 
-        for (key, aggregates) in state.groups {
-            for (value, builder) in key.0.into_iter().zip(&mut builders) {
+        for group in state.sorted_groups() {
+            for (value, builder) in group.key.0.into_iter().zip(&mut builders) {
                 builder.append(value.into_scalar())?;
             }
             let mut builder_index = self.keys.len();
-            for (aggregate, state) in self.aggregates.iter().zip(aggregates) {
+            for (aggregate, state) in self.aggregates.iter().zip(group.aggregates) {
                 let values = state.finish_states(aggregate)?;
                 for value in values {
                     let builder = builders.get_mut(builder_index).ok_or_else(|| {
@@ -214,6 +254,42 @@ impl GroupAggregateKernel {
             .map(|expr| KeyValue::try_from_scalar(eval_expr(expr, view, row)?))
             .collect::<JitResult<Vec<_>>>()
             .map(GroupKey)
+    }
+}
+
+impl GroupAggregateBatchBinding {
+    pub fn group_ids(&self) -> &[i64] {
+        &self.group_ids
+    }
+
+    pub fn selected_rows(&self) -> usize {
+        self.selected_rows
+    }
+}
+
+impl GroupAggregateState {
+    fn group_id(&mut self, key: GroupKey, aggregates: &[GroupAggregate]) -> usize {
+        if let Some(group_id) = self.group_ids.get(&key) {
+            return *group_id;
+        }
+
+        let group_id = self.groups.len();
+        self.group_ids.insert(key.clone(), group_id);
+        self.groups.push(GroupState {
+            key,
+            aggregates: aggregates.iter().map(AggregateState::empty).collect(),
+        });
+        group_id
+    }
+
+    fn sorted_groups(self) -> Vec<GroupState> {
+        let groups = self.groups;
+        let mut sorted = self.group_ids.into_iter().collect::<Vec<_>>();
+        sorted.sort_by(|(left, _), (right, _)| left.cmp(right));
+        sorted
+            .into_iter()
+            .map(|(_, group_id)| groups[group_id].clone())
+            .collect()
     }
 }
 

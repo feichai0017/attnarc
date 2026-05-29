@@ -111,13 +111,17 @@ LogicalResult GroupAggregateSinkOp::verify() {
     return failure();
 
   auto yield = cast<YieldOp>(getState().front().back());
-  if (yield.getValues().size() < 2)
+  if (getKeyCount() <= 0)
+    return emitOpError("key_count must be positive");
+
+  size_t keyCount = static_cast<size_t>(getKeyCount());
+  if (yield.getValues().size() <= keyCount)
     return emitOpError("state region must yield at least one key and one aggregate value");
 
-  for (Value value : yield.getValues()) {
+  for (Value value : yield.getValues().drop_front(keyCount)) {
     Type type = value.getType();
     if (!type.isIntOrIndexOrFloat())
-      return emitOpError("state region values must be fixed-width scalar types");
+      return emitOpError("aggregate state values must be fixed-width scalar types");
   }
 
   return success();

@@ -588,6 +588,58 @@ fn executes_group_avg_as_partial_state() {
     assert_eq!(sums.values().as_ref(), &[30, 30]);
 }
 
+#[test]
+fn binds_group_ids_for_selected_rows() {
+    let input_schema = Arc::new(Schema::new(vec![
+        Field::new("flag", DataType::Utf8, false),
+        Field::new("v", DataType::Int64, false),
+    ]));
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("flag", DataType::Utf8, false),
+        Field::new("sum_v", DataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        input_schema,
+        vec![
+            Arc::new(StringArray::from(vec!["A", "B", "A", "C"])),
+            Arc::new(Int64Array::from(vec![10, 20, 30, 40])),
+        ],
+    )
+    .unwrap();
+    let key = JitExpr::Column {
+        index: 0,
+        name: "flag".to_string(),
+        ty: JitType::Utf8,
+        nullable: false,
+    };
+    let value = JitExpr::Column {
+        index: 1,
+        name: "v".to_string(),
+        ty: JitType::Int64,
+        nullable: false,
+    };
+    let predicate = JitExpr::Binary {
+        op: JitBinaryOp::Lt,
+        left: Box::new(value.clone()),
+        right: Box::new(JitExpr::Literal(JitScalar::Int64(40))),
+        ty: JitType::Bool,
+        nullable: false,
+    };
+    let aggregate = GroupAggregate::new(AggregateFunc::Sum, value, JitType::Int64, "sum_v");
+    let kernel = GroupAggregateKernel::try_new(
+        &[PipelineStage::Filter(predicate)],
+        vec![key],
+        vec![aggregate],
+        output_schema,
+    )
+    .unwrap();
+    let mut state = kernel.new_state();
+    let binding = kernel.bind_batch(&mut state, &batch).unwrap();
+
+    assert_eq!(binding.group_ids(), &[0, 1, 0, -1]);
+    assert_eq!(binding.selected_rows(), 3);
+}
+
 fn and(left: JitExpr, right: JitExpr) -> JitExpr {
     JitExpr::Binary {
         op: JitBinaryOp::And,

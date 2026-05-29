@@ -721,6 +721,102 @@ async fn q1_shaped_composite_group_aggregate_uses_partial_state_pipeline() {
 }
 
 #[tokio::test]
+async fn q1_decimal_group_aggregate_shape_uses_partial_state_pipeline() {
+    let db = Database::new_temp().expect("database");
+    let money_type = DataType::Decimal128(12, 2);
+    let rate_type = DataType::Decimal128(4, 2);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("returnflag", DataType::Utf8, false),
+        Field::new("linestatus", DataType::Utf8, false),
+        Field::new("quantity", DataType::Int64, false),
+        Field::new("extendedprice", money_type.clone(), false),
+        Field::new("discount", rate_type.clone(), false),
+        Field::new("shipdate", DataType::Date32, false),
+    ]));
+    let price = Decimal128Array::from(vec![1000_i128, 2000, 3000, 4000])
+        .with_precision_and_scale(12, 2)
+        .expect("price decimal");
+    let discount = Decimal128Array::from(vec![10_i128, 20, 10, 0])
+        .with_precision_and_scale(4, 2)
+        .expect("discount decimal");
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(vec!["A", "A", "A", "R"])),
+            Arc::new(StringArray::from(vec!["F", "F", "O", "F"])),
+            Arc::new(Int64Array::from(vec![10, 20, 30, 40])),
+            Arc::new(price),
+            Arc::new(discount),
+            Arc::new(Date32Array::from(vec![10, 11, 12, 13])),
+        ],
+    )
+    .expect("batch");
+    db.register_batches("lineitem", schema, vec![batch])
+        .expect("table");
+
+    assert_eq!(
+        rows(
+            db.run(
+                "select returnflag, linestatus, \
+                        sum(quantity) as sum_qty, \
+                        sum(extendedprice) as sum_base_price, \
+                        sum(extendedprice * discount) as sum_disc_price, \
+                        avg(extendedprice) as avg_price, \
+                        count(*) as count_order \
+                 from lineitem \
+                 where shipdate <= date '1970-01-13' \
+                 group by returnflag, linestatus \
+                 order by returnflag, linestatus",
+            )
+            .await
+            .expect("query")
+        ),
+        vec![
+            vec![
+                "A".to_string(),
+                "F".to_string(),
+                "30".to_string(),
+                "Some(3000),22,2".to_string(),
+                "Some(50000),27,4".to_string(),
+                "Some(15000000),16,6".to_string(),
+                "2".to_string()
+            ],
+            vec![
+                "A".to_string(),
+                "O".to_string(),
+                "30".to_string(),
+                "Some(3000),22,2".to_string(),
+                "Some(30000),27,4".to_string(),
+                "Some(30000000),16,6".to_string(),
+                "1".to_string()
+            ],
+        ]
+    );
+
+    let trace = db.debug_last_trace().expect("trace");
+    assert!(
+        trace.physical_plan.contains("CompiledPipelineExec"),
+        "{}",
+        trace.physical_plan
+    );
+    assert!(
+        trace
+            .pipeline_candidates
+            .iter()
+            .any(|candidate| candidate.node == "CompiledPipelineExec"
+                && candidate.kind == PipelineKind::Aggregate
+                && candidate.compiled
+                && candidate.source == "arrow_batch"
+                && candidate.stages == vec!["filter"]
+                && candidate.sink == "group_aggregate"
+                && candidate.backend.as_deref() == Some("quill-runtime")
+                && candidate.reason == "compiled"),
+        "{:?}",
+        trace.pipeline_candidates
+    );
+}
+
+#[tokio::test]
 async fn f64_plain_sum_mlir_execution_preserves_empty_sum_null() {
     let db = database_with_mlir_execution();
     let schema = Arc::new(Schema::new(vec![
