@@ -1,5 +1,6 @@
 use quill_plan::PipelineGraph;
-use quill_runtime::CompiledKernel;
+
+use crate::CompiledKernel;
 
 #[derive(Debug, Clone)]
 pub struct CompiledPipeline {

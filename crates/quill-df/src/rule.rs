@@ -7,8 +7,7 @@ use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use serde::Serialize;
 
-use quill_jit::{FrontendAdapter, JitOptions, MlirBackend};
-use quill_runtime::KernelKind;
+use quill_jit::{FrontendAdapter, JitOptions, KernelKind, MlirBackend};
 
 use crate::compiler::PipelineCompiler;
 use crate::{

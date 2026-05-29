@@ -1,9 +1,7 @@
-use arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use serde::Serialize;
-
 use std::collections::BTreeMap;
 
-use quill_plan::{AggregateFunc, GroupAggregate, JitExpr, JitProjection, JitResult, JitType};
+use quill_plan::{AggregateFunc, GroupAggregate, JitExpr, JitProjection, JitType};
+use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FixedColumn {
@@ -13,8 +11,6 @@ pub struct FixedColumn {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum KernelKind {
-    Filter,
-    Projection,
     FilterProject,
     FilterSum,
     GroupAggregate,
@@ -97,14 +93,15 @@ impl PipelineSpec {
             return None;
         }
 
-        let mut columns = BTreeMap::new();
         if let Some(predicate) = predicate {
             if predicate.ty() != JitType::Bool {
                 return None;
             }
-            collect_fixed_width_columns(predicate, &mut columns)?;
         }
+
+        let mut columns = BTreeMap::new();
         for aggregate in aggregates {
+            ensure_group_update_aggregate(aggregate)?;
             collect_fixed_width_columns(&aggregate.expr, &mut columns)?;
         }
 
@@ -144,8 +141,6 @@ impl PipelineSpec {
 impl KernelKind {
     pub fn name(self) -> &'static str {
         match self {
-            Self::Filter => "filter",
-            Self::Projection => "projection",
             Self::FilterProject => "filter_project",
             Self::FilterSum => "filter_sum",
             Self::GroupAggregate => "group_aggregate",
@@ -163,21 +158,6 @@ pub struct CompiledKernel {
 }
 
 impl CompiledKernel {
-    pub fn new(
-        id: impl Into<String>,
-        kind: KernelKind,
-        backend: impl Into<String>,
-        executable: bool,
-    ) -> Self {
-        Self {
-            id: id.into(),
-            kind,
-            spec: PipelineSpec::generic(kind),
-            backend: backend.into(),
-            executable,
-        }
-    }
-
     pub fn with_spec(
         id: impl Into<String>,
         spec: PipelineSpec,
@@ -193,29 +173,6 @@ impl CompiledKernel {
             executable,
         }
     }
-}
-
-pub trait KernelBackend: Send + Sync {
-    fn name(&self) -> &str;
-
-    fn compile_filter(
-        &self,
-        input_schema: ArrowSchemaRef,
-        predicate: &JitExpr,
-    ) -> JitResult<CompiledKernel>;
-
-    fn compile_projection(
-        &self,
-        input_schema: ArrowSchemaRef,
-        projections: &[JitProjection],
-    ) -> JitResult<CompiledKernel>;
-
-    fn compile_filter_project(
-        &self,
-        input_schema: ArrowSchemaRef,
-        predicate: &JitExpr,
-        projections: &[JitProjection],
-    ) -> JitResult<CompiledKernel>;
 }
 
 fn collect_fixed_width_columns(
@@ -265,6 +222,133 @@ fn ensure_record_output_type(ty: JitType) -> Option<()> {
     }
 }
 
+fn ensure_group_update_aggregate(aggregate: &GroupAggregate) -> Option<()> {
+    match aggregate.func {
+        AggregateFunc::Count => {
+            let [count_ty] = aggregate.state_types.as_slice() else {
+                return None;
+            };
+            ensure_group_update_count_type(*count_ty)
+        }
+        AggregateFunc::Avg => {
+            let [count_ty, sum_ty] = aggregate.state_types.as_slice() else {
+                return None;
+            };
+            ensure_group_update_count_type(*count_ty)?;
+            ensure_group_update_state_type(*sum_ty)?;
+            ensure_group_update_measure_type(aggregate.expr.ty())
+        }
+        AggregateFunc::Sum | AggregateFunc::Min | AggregateFunc::Max => {
+            let [state_ty] = aggregate.state_types.as_slice() else {
+                return None;
+            };
+            ensure_group_update_state_type(*state_ty)?;
+            ensure_group_update_measure_type(aggregate.expr.ty())
+        }
+    }
+}
+
+fn ensure_group_update_count_type(ty: JitType) -> Option<()> {
+    match ty {
+        JitType::Int64 | JitType::UInt64 => Some(()),
+        JitType::Bool
+        | JitType::Date32
+        | JitType::Int32
+        | JitType::Float64
+        | JitType::Utf8
+        | JitType::Decimal128 { .. } => None,
+    }
+}
+
+fn ensure_group_update_state_type(ty: JitType) -> Option<()> {
+    match ty {
+        JitType::Int64 | JitType::UInt64 | JitType::Float64 | JitType::Decimal128 { .. } => {
+            Some(())
+        }
+        JitType::Bool | JitType::Date32 | JitType::Int32 | JitType::Utf8 => None,
+    }
+}
+
+fn ensure_group_update_measure_type(ty: JitType) -> Option<()> {
+    match ty {
+        JitType::Int64 | JitType::Float64 | JitType::Decimal128 { .. } => Some(()),
+        JitType::Bool | JitType::Date32 | JitType::Int32 | JitType::UInt64 | JitType::Utf8 => None,
+    }
+}
+
 fn is_plain_sum_output(ty: JitType) -> bool {
     matches!(ty, JitType::Float64 | JitType::Decimal128 { .. })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quill_plan::{JitBinaryOp, JitScalar};
+
+    #[test]
+    fn records_fixed_width_filter_project_spec() {
+        let predicate = JitExpr::Binary {
+            op: JitBinaryOp::Gt,
+            left: Box::new(column(1, JitType::Int64)),
+            right: Box::new(JitExpr::Literal(JitScalar::Int64(10))),
+            ty: JitType::Bool,
+            nullable: false,
+        };
+        let projection = JitProjection::new(column(0, JitType::Int64), "id");
+
+        let spec = PipelineSpec::record_project(&predicate, &[projection]).unwrap();
+
+        assert_eq!(spec.name(), "record_project");
+        assert_eq!(spec.kind(), KernelKind::FilterProject);
+    }
+
+    #[test]
+    fn rejects_variable_width_record_output_spec() {
+        let predicate = JitExpr::Literal(JitScalar::Bool(true));
+        let projection = JitProjection::new(column(0, JitType::Utf8), "name");
+
+        assert!(PipelineSpec::record_project(&predicate, &[projection]).is_none());
+    }
+
+    #[test]
+    fn records_decimal_plain_sum_spec() {
+        let predicate = JitExpr::Literal(JitScalar::Bool(true));
+        let measure = column(
+            2,
+            JitType::Decimal128 {
+                precision: 30,
+                scale: 4,
+            },
+        );
+
+        let spec = PipelineSpec::filter_sum(&predicate, &measure).unwrap();
+
+        assert_eq!(spec.name(), "plain_sum");
+        assert_eq!(spec.kind(), KernelKind::FilterSum);
+    }
+
+    #[test]
+    fn records_group_update_spec_with_utf8_key() {
+        let key = column(0, JitType::Utf8);
+        let aggregate = GroupAggregate::new(
+            AggregateFunc::Sum,
+            column(1, JitType::Int64),
+            JitType::Int64,
+            "sum_v",
+        );
+
+        let spec = PipelineSpec::group_aggregate(None, &[key], &[aggregate]).unwrap();
+
+        assert_eq!(spec.name(), "group_aggregate");
+        assert_eq!(spec.kind(), KernelKind::GroupAggregate);
+    }
+
+    fn column(index: usize, ty: JitType) -> JitExpr {
+        JitExpr::Column {
+            index,
+            name: format!("c{index}"),
+            ty,
+            nullable: false,
+        }
+    }
 }

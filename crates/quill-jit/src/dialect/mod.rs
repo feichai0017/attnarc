@@ -168,7 +168,9 @@ impl QuillDialectModule {
                         ensure_selection(text, batch, &mut selection, next_selection)?
                     }
                 };
-                append_group_aggregate(text, "%group0", batch, &selection, keys, aggregates)?;
+                append_group_aggregate(
+                    text, "%groups0", "%group0", batch, &selection, keys, aggregates,
+                )?;
             }
         }
         Ok(())
@@ -307,6 +309,7 @@ fn append_plain_sum(
 
 fn append_group_aggregate(
     text: &mut String,
+    group_ids: &str,
     out: &str,
     batch: &str,
     selection: &str,
@@ -319,32 +322,78 @@ fn append_group_aggregate(
         ));
     }
 
-    let mut emitter = RegionEmitter::new("row");
-    let mut values = Vec::with_capacity(keys.len() + aggregates.len());
-    for key in keys {
-        values.push(emitter.emit_expr(key)?);
-    }
-    for aggregate in aggregates {
-        values.push(emitter.emit_expr(&aggregate.expr)?);
-    }
+    append_group_ids(text, group_ids, batch, selection, keys)?;
+    append_group_update(text, out, batch, selection, group_ids, aggregates)
+}
 
-    let funcs = aggregates
+fn append_group_ids(
+    text: &mut String,
+    out: &str,
+    batch: &str,
+    selection: &str,
+    keys: &[JitExpr],
+) -> JitResult<()> {
+    let mut emitter = RegionEmitter::new("row");
+    let values = keys
         .iter()
-        .map(|aggregate| aggregate.func.name())
-        .collect::<Vec<_>>()
-        .join(",");
-    let _ = writeln!(text, "    // qjit.group_funcs = {funcs}");
+        .map(|key| emitter.emit_expr(key))
+        .collect::<JitResult<Vec<_>>>()?;
     let _ = writeln!(
         text,
-        "    {out} = quill.sink.group_aggregate {batch}, {selection} {{"
+        "    {out} = quill.exec.group_ids {batch}, {selection} {{"
     );
     append_region_values(text, &emitter, &values)?;
     let _ = writeln!(
         text,
-        "    }} {{ key_count = {} : i64 }} : !quill.batch, !quill.selection -> !quill.batch",
-        keys.len()
+        "    }} : !quill.batch, !quill.selection -> !quill.group_ids"
     );
     Ok(())
+}
+
+fn append_group_update(
+    text: &mut String,
+    out: &str,
+    batch: &str,
+    selection: &str,
+    group_ids: &str,
+    aggregates: &[GroupAggregate],
+) -> JitResult<()> {
+    let mut emitter = RegionEmitter::new("row");
+    let values = aggregates
+        .iter()
+        .map(|aggregate| emitter.emit_expr(&aggregate.expr))
+        .collect::<JitResult<Vec<_>>>()?;
+
+    let funcs = aggregates
+        .iter()
+        .map(|aggregate| aggregate.func.name())
+        .collect::<Vec<_>>();
+    let state_types = aggregates
+        .iter()
+        .flat_map(|aggregate| aggregate.state_types.iter().copied())
+        .map(state_type_name)
+        .collect::<Vec<_>>();
+    let funcs_attr = mlir_string_array(&funcs);
+    let state_types_attr = mlir_string_array(&state_types);
+    let _ = writeln!(
+        text,
+        "    {out} = quill.sink.group_update {batch}, {selection}, {group_ids} {{"
+    );
+    append_region_values(text, &emitter, &values)?;
+    let _ = writeln!(
+        text,
+        "    }} {{ aggregate_funcs = {funcs_attr}, state_types = {state_types_attr} }} : !quill.batch, !quill.selection, !quill.group_ids -> !quill.batch"
+    );
+    Ok(())
+}
+
+fn mlir_string_array(values: &[&str]) -> String {
+    let values = values
+        .iter()
+        .map(|value| format!("\"{value}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{values}]")
 }
 
 fn append_region_body(
@@ -726,6 +775,18 @@ fn format_float(value: f64) -> String {
     }
 }
 
+fn state_type_name(ty: JitType) -> &'static str {
+    match ty {
+        JitType::Int64 => "i64",
+        JitType::UInt64 => "u64",
+        JitType::Float64 => "f64",
+        JitType::Decimal128 { .. } => "i128",
+        JitType::Bool => "i1",
+        JitType::Date32 | JitType::Int32 => "i32",
+        JitType::Utf8 => "scalar",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
@@ -819,10 +880,11 @@ mod tests {
             module.pipeline_spec().map(|spec| spec.name()),
             Some("group_aggregate")
         );
-        assert!(text.contains("quill.sink.group_aggregate"));
-        assert!(text.contains("// qjit.group_funcs = sum"));
+        assert!(text.contains("quill.exec.group_ids"));
+        assert!(text.contains("quill.sink.group_update"));
+        assert!(text.contains("aggregate_funcs = [\"sum\"]"));
         assert!(text.contains("// qjit.pipeline = group_aggregate"));
-        assert!(text.contains("key_count = 1 : i64"));
+        assert!(text.contains("!quill.group_ids"));
         assert!(text.contains("quill.yield"));
     }
 

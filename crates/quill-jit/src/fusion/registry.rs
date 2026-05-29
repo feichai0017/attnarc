@@ -28,12 +28,12 @@ const BUILTIN_PATTERNS: [FusionPattern; 4] = [
         lowering: FusionLoweringKind::Record,
     },
     FusionPattern {
-        id: "filter_plain_sum",
+        id: "filter_plain_aggregate",
         source: PipelineSource::ArrowBatch,
         stages: &FILTER_STAGES,
         sink: OperatorKind::PlainAggregate,
         constraints: &PLAIN_SUM_CONSTRAINTS,
-        lowering: FusionLoweringKind::PlainSum,
+        lowering: FusionLoweringKind::PlainAggregate,
     },
     FusionPattern {
         id: "filter_group_aggregate",
@@ -84,6 +84,9 @@ impl FusionRegistry {
     pub fn match_pipeline(self, graph: &PipelineGraph) -> Option<FusionMatch> {
         self.patterns.iter().copied().find_map(|pattern| {
             if !pattern.matches_shape(graph) {
+                return None;
+            }
+            if !pattern.satisfies_constraints(graph) {
                 return None;
             }
             let lowering = extract_lowering(pattern.lowering, graph)?;

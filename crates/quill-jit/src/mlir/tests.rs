@@ -3,55 +3,7 @@ use crate::{
     JitBinaryOp, JitExpr, JitProjection, JitScalar, JitType, MlirBackend, PipelineGraph,
     PipelineKind, PipelineStage,
 };
-
-#[test]
-fn emits_textual_filter_module() {
-    let expr = i64_gt_ten(true);
-
-    let module = MlirBackend::new().lower_filter(&expr).unwrap();
-    assert!(module.text.contains("func.func @quill_filter_"));
-    assert!(module.text.contains("arith.cmpi sgt"));
-    assert!(module.text.contains("qjit.kind = filter"));
-    assert!(module
-        .text
-        .contains("col(0, a, i64, nullable=true) > 10:i64"));
-}
-
-#[test]
-fn backend_verifies_generated_module() {
-    let expr = i64_gt_ten(true);
-
-    let module = MlirBackend::new().lower_filter(&expr).unwrap();
-    MlirBackend::new().verify_module(&module).unwrap();
-}
-
-#[test]
-fn emits_filter_project_module() {
-    let predicate = i64_gt_ten(true);
-    let projection = JitProjection::new(
-        JitExpr::Binary {
-            op: JitBinaryOp::Add,
-            left: Box::new(JitExpr::Column {
-                index: 0,
-                name: "a".to_string(),
-                ty: JitType::Int64,
-                nullable: true,
-            }),
-            right: Box::new(JitExpr::Literal(JitScalar::Int64(1))),
-            ty: JitType::Int64,
-            nullable: true,
-        },
-        "a_plus_one",
-    );
-
-    let module = MlirBackend::new()
-        .lower_filter_project(&predicate, &[projection])
-        .unwrap();
-    assert!(module.text.contains("qjit.kind = filter_project"));
-    assert!(module.text.contains("arith.cmpi sgt"));
-    assert!(module.text.contains("arith.addi"));
-    MlirBackend::new().verify_module(&module).unwrap();
-}
+use quill_runtime::GroupAggregateStateField;
 
 #[test]
 fn emits_quill_dialect_pipeline_skeleton() {
@@ -128,7 +80,8 @@ fn verifies_formal_group_aggregate_dialect_pipeline() {
         .lower_graph_to_quill_mlir("group_quill_region", &pipeline)
         .unwrap();
 
-    assert!(module.text.contains("quill.sink.group_aggregate"));
+    assert!(module.text.contains("quill.exec.group_ids"));
+    assert!(module.text.contains("quill.sink.group_update"));
     MlirBackend::new().verify_module(&module).unwrap();
 }
 
@@ -156,7 +109,7 @@ fn verifies_formal_group_aggregate_with_utf8_key() {
         .lower_graph_to_quill_mlir("group_utf8_key_region", &pipeline)
         .unwrap();
 
-    assert!(module.text.contains("key_count = 1 : i64"));
+    assert!(module.text.contains("quill.exec.group_ids"));
     assert!(module.text.contains("!quill.scalar"));
     MlirBackend::new().verify_module(&module).unwrap();
 }
@@ -197,11 +150,16 @@ module {
       %ok = arith.constant true
       quill.yield %ok : i1
     } : !quill.batch -> !quill.selection
-    %out = quill.sink.group_aggregate %batch, %sel {
+    %groups = quill.exec.group_ids %batch, %sel {
     ^bb0(%row: !quill.row):
       %k = quill.column %row { index = 0 : i64 } : !quill.row -> i64
       quill.yield %k : i64
-    } { key_count = 1 : i64 } : !quill.batch, !quill.selection -> !quill.batch
+    } : !quill.batch, !quill.selection -> !quill.group_ids
+    %out = quill.sink.group_update %batch, %sel, %groups {
+    ^bb0(%row: !quill.row):
+      %k = quill.column %row { index = 0 : i64 } : !quill.row -> i64
+      quill.yield %k : i64
+    } { aggregate_funcs = ["sum"], state_types = [] } : !quill.batch, !quill.selection, !quill.group_ids -> !quill.batch
     return
   }
 }
@@ -228,28 +186,6 @@ fn lowers_q6_quill_dialect_to_mlir() {
     assert!(module.text.contains("llvm.emit_c_interface"));
     assert!(module.text.contains("scf.for"));
     assert!(!module.text.contains("quill."));
-    MlirBackend::new().verify_module(&module).unwrap();
-}
-
-#[test]
-fn emits_i64_predicate_module() {
-    let predicate = i64_gt_ten(false);
-
-    let module = MlirBackend::new().lower_i64_predicate(&predicate).unwrap();
-    assert!(module.text.contains("llvm.emit_c_interface"));
-    assert!(module.text.contains("arith.select"));
-    MlirBackend::new().verify_module(&module).unwrap();
-}
-
-#[test]
-fn emits_i64_filter_module() {
-    let predicate = i64_gt_ten(false);
-
-    let module = MlirBackend::new().lower_i64_filter(&predicate).unwrap();
-    assert!(module.text.contains("func.func @quill_i64_filter_"));
-    assert!(module.text.contains("scf.for"));
-    assert!(module.text.contains("llvm.load"));
-    assert!(module.text.contains("llvm.store"));
     MlirBackend::new().verify_module(&module).unwrap();
 }
 
@@ -309,61 +245,6 @@ fn emits_decimal_plain_sum_module() {
     assert!(module.text.contains("arith.addi"));
     assert!(module.text.contains("llvm.store"));
     MlirBackend::new().verify_module(&module).unwrap();
-}
-
-#[test]
-fn invokes_i64_predicate_with_execution_engine() {
-    let predicate = i64_gt_ten(false);
-
-    let backend = MlirBackend::new();
-    assert!(!backend.invoke_i64_predicate(&predicate, 10).unwrap());
-    assert!(backend.invoke_i64_predicate(&predicate, 11).unwrap());
-}
-
-#[test]
-fn reuses_compiled_i64_predicate_artifact() {
-    let predicate = i64_gt_ten(false);
-    let module = MlirBackend::new().lower_i64_predicate(&predicate).unwrap();
-    let compiled = super::compiled::compile_i64_predicate(&module).unwrap();
-
-    assert!(!compiled.invoke(9).unwrap());
-    assert!(!compiled.invoke(10).unwrap());
-    assert!(compiled.invoke(11).unwrap());
-}
-
-#[test]
-fn invokes_compiled_i64_filter_kernel() {
-    let predicate = i64_gt_ten(false);
-    let compiled = MlirBackend::new().compile_i64_filter(&predicate).unwrap();
-    let input = [9_i64, 10, 11, 42];
-    let mut output = [255_u8; 4];
-
-    compiled.invoke(&input, &mut output).unwrap();
-
-    assert_eq!(output, [0, 0, 1, 1]);
-}
-
-#[test]
-fn invokes_compiled_i64_filter_with_nonzero_column_index() {
-    let predicate = JitExpr::Binary {
-        op: JitBinaryOp::Gt,
-        left: Box::new(JitExpr::Column {
-            index: 1,
-            name: "v".to_string(),
-            ty: JitType::Int64,
-            nullable: false,
-        }),
-        right: Box::new(JitExpr::Literal(JitScalar::Int64(10))),
-        ty: JitType::Bool,
-        nullable: false,
-    };
-    let compiled = MlirBackend::new().compile_i64_filter(&predicate).unwrap();
-    let input = [10_i64, 11, 12];
-    let mut output = [0_u8; 3];
-
-    compiled.invoke(&input, &mut output).unwrap();
-
-    assert_eq!(output, [0, 1, 1]);
 }
 
 #[test]
@@ -543,6 +424,61 @@ fn invokes_compiled_decimal_plain_sum_kernel() {
     );
 }
 
+#[test]
+fn invokes_compiled_group_aggregate_dense_update_kernel() {
+    let key = int64_col(0, "k");
+    let value = int64_col(1, "v");
+    let count_star = JitExpr::Literal(JitScalar::Int64(1));
+    let aggregates = vec![
+        GroupAggregate::new(AggregateFunc::Sum, value.clone(), JitType::Int64, "sum_v"),
+        GroupAggregate::new(
+            AggregateFunc::Count,
+            count_star,
+            JitType::Int64,
+            "count_star",
+        ),
+        GroupAggregate::new_with_states(
+            AggregateFunc::Avg,
+            value.clone(),
+            vec![JitType::UInt64, JitType::Int64],
+            "avg_v",
+        ),
+        GroupAggregate::new(AggregateFunc::Min, value.clone(), JitType::Int64, "min_v"),
+        GroupAggregate::new(AggregateFunc::Max, value, JitType::Int64, "max_v"),
+    ];
+    let compiled = MlirBackend::new()
+        .compile_group_aggregate_update(&[key], &aggregates)
+        .unwrap();
+    let group_ids = [0_i64, 1, -1, 0];
+    let values = [10_i64, 20, 30, 5];
+    let mut state_fields = vec![
+        int64_state(2),
+        int64_state(2),
+        uint64_state(2),
+        int64_state(2),
+        int64_state(2),
+        int64_state(2),
+    ];
+
+    compiled
+        .invoke(
+            &group_ids,
+            &[FixedColumnInput::Int64 {
+                index: 1,
+                values: &values,
+            }],
+            &mut state_fields,
+        )
+        .unwrap();
+
+    assert_int64_state(&state_fields[0], &[15, 20], &[1, 1]);
+    assert_int64_state(&state_fields[1], &[2, 1], &[1, 1]);
+    assert_uint64_state(&state_fields[2], &[2, 1], &[1, 1]);
+    assert_int64_state(&state_fields[3], &[15, 20], &[1, 1]);
+    assert_int64_state(&state_fields[4], &[5, 20], &[1, 1]);
+    assert_int64_state(&state_fields[5], &[10, 20], &[1, 1]);
+}
+
 fn i64_gt_ten(nullable: bool) -> JitExpr {
     JitExpr::Binary {
         op: JitBinaryOp::Gt,
@@ -574,6 +510,53 @@ fn i64_plus_one_projection(index: usize) -> JitProjection {
         },
         "plus_one",
     )
+}
+
+fn int64_col(index: usize, name: &str) -> JitExpr {
+    JitExpr::Column {
+        index,
+        name: name.to_string(),
+        ty: JitType::Int64,
+        nullable: false,
+    }
+}
+
+fn int64_state(len: usize) -> GroupAggregateStateField {
+    GroupAggregateStateField::Int64 {
+        values: vec![0; len],
+        valid: vec![0; len],
+    }
+}
+
+fn uint64_state(len: usize) -> GroupAggregateStateField {
+    GroupAggregateStateField::UInt64 {
+        values: vec![0; len],
+        valid: vec![0; len],
+    }
+}
+
+fn assert_int64_state(field: &GroupAggregateStateField, values: &[i64], valid: &[u8]) {
+    let GroupAggregateStateField::Int64 {
+        values: actual_values,
+        valid: actual_valid,
+    } = field
+    else {
+        panic!("expected Int64 state");
+    };
+    assert_eq!(actual_values, values);
+    assert_eq!(actual_valid, valid);
+}
+
+fn assert_uint64_state(field: &GroupAggregateStateField, values: &[u64], valid: &[u8]) {
+    let GroupAggregateStateField::UInt64 {
+        values: actual_values,
+        valid: actual_valid,
+    } = field
+    else {
+        panic!("expected UInt64 state");
+    };
+    assert_eq!(actual_values, values);
+    assert_eq!(actual_valid, valid);
 }
 
 fn f64_product_measure() -> JitExpr {

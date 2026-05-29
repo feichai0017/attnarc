@@ -6,10 +6,8 @@ mod lower;
 mod tests;
 mod verify;
 
-use arrow::datatypes::SchemaRef as ArrowSchemaRef;
-
 use crate::{
-    CompiledKernel, JitExpr, JitProjection, JitResult, KernelBackend, KernelKind, PipelineGraph,
+    FixedColumn, GroupAggregate, JitExpr, JitProjection, JitResult, PipelineGraph,
     QuillDialectModule,
 };
 
@@ -19,16 +17,16 @@ pub struct MlirModule {
     pub text: String,
 }
 
-pub type MlirColumn = quill_runtime::FixedColumn;
+pub type MlirColumn = FixedColumn;
 
 #[derive(Debug, Default)]
 pub struct MlirBackend;
 
 pub use compiled::{
-    CompiledI64Filter, CompiledPlainSum, CompiledRecordPipeline, FixedColumnInput,
+    CompiledGroupAggregateUpdate, CompiledPlainSum, CompiledRecordPipeline, FixedColumnInput,
     RecordPipelineOutput,
 };
-pub use dispatch::{execute_filter_project, execute_filter_sum};
+pub use dispatch::{execute_filter_project, execute_filter_sum, execute_group_aggregate_update};
 
 impl MlirBackend {
     pub fn new() -> Self {
@@ -37,30 +35,6 @@ impl MlirBackend {
 
     pub fn is_available(&self) -> bool {
         true
-    }
-
-    pub fn lower_filter(&self, predicate: &JitExpr) -> JitResult<MlirModule> {
-        emit::lower_filter(predicate)
-    }
-
-    pub fn lower_projection(&self, projections: &[JitProjection]) -> JitResult<MlirModule> {
-        emit::lower_projection(projections)
-    }
-
-    pub fn lower_filter_project(
-        &self,
-        predicate: &JitExpr,
-        projections: &[JitProjection],
-    ) -> JitResult<MlirModule> {
-        emit::lower_filter_project(predicate, projections)
-    }
-
-    pub fn lower_i64_predicate(&self, predicate: &JitExpr) -> JitResult<MlirModule> {
-        emit::lower_i64_predicate(predicate)
-    }
-
-    pub fn lower_i64_filter(&self, predicate: &JitExpr) -> JitResult<MlirModule> {
-        emit::lower_i64_filter(predicate)
     }
 
     pub fn lower_record_pipeline(
@@ -80,6 +54,17 @@ impl MlirBackend {
     pub fn lower_plain_sum(&self, predicate: &JitExpr, measure: &JitExpr) -> JitResult<MlirModule> {
         let pipeline = PipelineGraph::filter_sum(predicate.clone(), measure.clone());
         let dialect = self.emit_quill_dialect(emit::next_symbol("quill_plain_sum"), &pipeline);
+        lower::lower_quill_dialect(&dialect)
+    }
+
+    pub fn lower_group_aggregate_update(
+        &self,
+        keys: &[JitExpr],
+        aggregates: &[GroupAggregate],
+    ) -> JitResult<MlirModule> {
+        let pipeline = PipelineGraph::group_aggregate(vec![], keys.to_vec(), aggregates.to_vec());
+        let dialect =
+            self.emit_quill_dialect(emit::next_symbol("quill_group_aggregate"), &pipeline);
         lower::lower_quill_dialect(&dialect)
     }
 
@@ -105,18 +90,6 @@ impl MlirBackend {
         graph: &PipelineGraph,
     ) -> QuillDialectModule {
         QuillDialectModule::from_graph(symbol, graph)
-    }
-
-    pub fn invoke_i64_predicate(&self, predicate: &JitExpr, value: i64) -> JitResult<bool> {
-        let module = self.lower_i64_predicate(predicate)?;
-        self.verify_module(&module)?;
-        compiled::invoke_i64_predicate(&module, value)
-    }
-
-    pub fn compile_i64_filter(&self, predicate: &JitExpr) -> JitResult<CompiledI64Filter> {
-        let module = self.lower_i64_filter(predicate)?;
-        self.verify_module(&module)?;
-        compiled::compile_i64_filter(&module)
     }
 
     pub fn compile_record_pipeline(
@@ -164,59 +137,38 @@ impl MlirBackend {
         compiled::compile_plain_sum(&module, columns, output_type)
     }
 
+    pub fn compile_group_aggregate_update(
+        &self,
+        keys: &[JitExpr],
+        aggregates: &[GroupAggregate],
+    ) -> JitResult<CompiledGroupAggregateUpdate> {
+        let spec =
+            crate::PipelineSpec::group_aggregate(None, keys, aggregates).ok_or_else(|| {
+                crate::JitError::UnsupportedExpr(
+                    "group aggregate update requires fixed-width aggregate state".to_string(),
+                )
+            })?;
+        let crate::PipelineSpec::GroupAggregate {
+            columns,
+            aggregate_funcs,
+            state_types,
+            ..
+        } = spec
+        else {
+            unreachable!("group_aggregate returned another spec")
+        };
+        let module = self.lower_group_aggregate_update(keys, aggregates)?;
+        self.verify_module(&module)?;
+        compiled::compile_group_aggregate_update(&module, columns, aggregate_funcs, state_types)
+    }
+
     pub fn verify_module(&self, module: &MlirModule) -> JitResult<()> {
         verify::verify_module(module)
     }
 }
 
-impl KernelBackend for MlirBackend {
-    fn name(&self) -> &str {
+impl MlirBackend {
+    pub fn name(&self) -> &str {
         "mlir"
-    }
-
-    fn compile_filter(
-        &self,
-        _input_schema: ArrowSchemaRef,
-        predicate: &JitExpr,
-    ) -> JitResult<CompiledKernel> {
-        let module = self.lower_filter(predicate)?;
-        self.verify_module(&module)?;
-        Ok(CompiledKernel::new(
-            module.symbol,
-            KernelKind::Filter,
-            self.name(),
-            false,
-        ))
-    }
-
-    fn compile_projection(
-        &self,
-        _input_schema: ArrowSchemaRef,
-        projections: &[JitProjection],
-    ) -> JitResult<CompiledKernel> {
-        let module = self.lower_projection(projections)?;
-        self.verify_module(&module)?;
-        Ok(CompiledKernel::new(
-            module.symbol,
-            KernelKind::Projection,
-            self.name(),
-            false,
-        ))
-    }
-
-    fn compile_filter_project(
-        &self,
-        _input_schema: ArrowSchemaRef,
-        predicate: &JitExpr,
-        projections: &[JitProjection],
-    ) -> JitResult<CompiledKernel> {
-        let module = self.lower_filter_project(predicate, projections)?;
-        self.verify_module(&module)?;
-        Ok(CompiledKernel::new(
-            module.symbol,
-            KernelKind::FilterProject,
-            self.name(),
-            false,
-        ))
     }
 }

@@ -37,7 +37,7 @@ lowering, Arrow runtime, and compiled execution path.
 
 Operator semantics live in `quill-plan`; fusion policy lives in
 `quill-jit`. `PipelineGraph` keeps semantic operators such as `filter`,
-`project`, `plain_sum`, and `group_aggregate`; the `quill-jit` fusion registry
+`project`, `plain_aggregate`, and `group_aggregate`; the `quill-jit` fusion registry
 selects supported fragments, and MLIR lowering turns those fragments into fused
 loops. That keeps frontend adapters thin and avoids query-specific fused
 operators.
@@ -62,12 +62,12 @@ pass registration live in `quill-mlir` because those are native MLIR C++ API
 surfaces. Rust calls into that package through `melior`.
 
 Current compiled coverage is intentionally narrow: fixed-width
-`filter -> project -> record_batch` and fixed-width `filter -> SUM`, including
-the Q6-style `Date32`/`Decimal128` case. `group_aggregate` pipelines can be
-replaced through the Arrow host runtime for fixed-width keys and Utf8 keys; MLIR
-hash aggregate lowering and string key interning are still the next step.
-Unsupported expressions or unsafe Arrow layouts stay on the safe Rust runtime or
-DataFusion path.
+`filter -> project -> record_batch`, fixed-width `filter -> SUM`, including the
+Q6-style `Date32`/`Decimal128` case, and dense `group_ids -> group_update`
+state updates for Q1-style pipelines. Runtime still owns Arrow binding, key interning, dense
+group id assignment, and final materialization; full MLIR hash probe/insert is a
+later step. Unsupported expressions or unsafe Arrow layouts stay on the safe
+Rust runtime or DataFusion path.
 
 ## Quick Start
 

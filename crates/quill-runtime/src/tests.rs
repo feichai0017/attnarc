@@ -13,8 +13,8 @@ use quill_plan::{
 };
 
 use super::{
-    FilterProjectKernel, FilterSumKernel, FilterSumValue, FixedColumn, GroupAggregateKernel,
-    PipelineSpec,
+    FilterProjectKernel, FilterSumKernel, FilterSumValue, GroupAggregateKernel,
+    GroupAggregateStateField,
 };
 
 #[test]
@@ -67,23 +67,6 @@ fn executes_filter_project_with_nulls() {
         output_schema,
     )
     .unwrap();
-
-    assert_eq!(
-        kernel.spec(),
-        Some(&PipelineSpec::RecordProject {
-            columns: vec![
-                FixedColumn {
-                    index: 0,
-                    ty: JitType::Int64
-                },
-                FixedColumn {
-                    index: 1,
-                    ty: JitType::Int64
-                }
-            ],
-            output_types: vec![JitType::Int64],
-        })
-    );
 
     let output = kernel.execute(&batch).unwrap();
     let values = output
@@ -218,27 +201,6 @@ fn executes_plain_sum_with_nulls() {
     )
     .unwrap();
 
-    assert_eq!(
-        kernel.spec(),
-        Some(&PipelineSpec::PlainSum {
-            columns: vec![
-                FixedColumn {
-                    index: 0,
-                    ty: JitType::Int64
-                },
-                FixedColumn {
-                    index: 1,
-                    ty: JitType::Float64
-                },
-                FixedColumn {
-                    index: 2,
-                    ty: JitType::Float64
-                }
-            ],
-            output_type: JitType::Float64
-        })
-    );
-
     let output = kernel.execute(&batch).unwrap();
     assert_eq!(output, FilterSumValue::Float64(Some(4.0)));
 }
@@ -304,43 +266,6 @@ fn executes_decimal_plain_sum_with_date_predicate() {
         nullable: true,
     };
     let kernel = FilterSumKernel::try_new(predicate, measure).unwrap();
-
-    assert_eq!(
-        kernel.spec(),
-        Some(&PipelineSpec::PlainSum {
-            columns: vec![
-                FixedColumn {
-                    index: 0,
-                    ty: JitType::Date32
-                },
-                FixedColumn {
-                    index: 1,
-                    ty: JitType::Decimal128 {
-                        precision: 15,
-                        scale: 2
-                    }
-                },
-                FixedColumn {
-                    index: 2,
-                    ty: JitType::Decimal128 {
-                        precision: 15,
-                        scale: 2
-                    }
-                },
-                FixedColumn {
-                    index: 3,
-                    ty: JitType::Decimal128 {
-                        precision: 15,
-                        scale: 2
-                    }
-                },
-            ],
-            output_type: JitType::Decimal128 {
-                precision: 30,
-                scale: 4
-            }
-        })
-    );
 
     let output = kernel.execute(&batch).unwrap();
     assert_eq!(
@@ -638,6 +563,82 @@ fn binds_group_ids_for_selected_rows() {
 
     assert_eq!(binding.group_ids(), &[0, 1, 0, -1]);
     assert_eq!(binding.selected_rows(), 3);
+}
+
+#[test]
+fn flushes_dense_group_state_before_runtime_fallback() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("v", DataType::Int64, false),
+    ]));
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("sum_v", DataType::Int64, true),
+    ]));
+    let key = JitExpr::Column {
+        index: 0,
+        name: "k".to_string(),
+        ty: JitType::Int64,
+        nullable: false,
+    };
+    let value = JitExpr::Column {
+        index: 1,
+        name: "v".to_string(),
+        ty: JitType::Int64,
+        nullable: false,
+    };
+    let aggregate = GroupAggregate::new(AggregateFunc::Sum, value, JitType::Int64, "sum_v");
+    let kernel =
+        GroupAggregateKernel::try_new(&[], vec![key], vec![aggregate], output_schema).unwrap();
+    let mut state = kernel.new_state();
+    let first = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![10])),
+        ],
+    )
+    .unwrap();
+    let first_binding = kernel.bind_batch(&mut state, &first).unwrap();
+    assert_eq!(first_binding.group_ids(), &[0]);
+
+    {
+        let dense = kernel.dense_state_mut(&mut state).unwrap();
+        let [GroupAggregateStateField::Int64 { values, valid }] = dense.fields_mut() else {
+            panic!("expected one int64 dense state field");
+        };
+        values[0] = 10;
+        valid[0] = 1;
+    }
+
+    let second = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(Int64Array::from(vec![5, 7])),
+        ],
+    )
+    .unwrap();
+    let second_binding = kernel.bind_batch(&mut state, &second).unwrap();
+    assert_eq!(second_binding.group_ids(), &[0, 1]);
+    kernel.flush_dense_state(&mut state).unwrap();
+    kernel
+        .accumulate_bound(&mut state, &second, &second_binding)
+        .unwrap();
+
+    let output = kernel.finish(state).unwrap();
+    let keys = output
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let sums = output
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(keys.values().as_ref(), &[1, 2]);
+    assert_eq!(sums.values().as_ref(), &[15, 7]);
 }
 
 fn and(left: JitExpr, right: JitExpr) -> JitExpr {

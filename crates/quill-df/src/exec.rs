@@ -15,10 +15,10 @@ use datafusion::physical_plan::{
 };
 use futures::{ready, Stream, StreamExt};
 
+use quill_jit::{CompiledKernel, KernelKind};
 use quill_plan::PipelineKind;
 use quill_runtime::{
-    CompiledKernel, FilterProjectKernel, FilterSumKernel, FilterSumValue, GroupAggregateKernel,
-    GroupAggregateState, KernelKind,
+    FilterProjectKernel, FilterSumKernel, FilterSumValue, GroupAggregateKernel, GroupAggregateState,
 };
 
 #[derive(Debug, Clone)]
@@ -167,7 +167,22 @@ impl CompiledPipelineExec {
         state: &mut GroupAggregateState,
         batch: &RecordBatch,
     ) -> Result<()> {
-        runtime.accumulate(state, batch).map_err(crate::map_jit_err)
+        let binding = runtime
+            .bind_batch(state, batch)
+            .map_err(crate::map_jit_err)?;
+        if quill_jit::execute_group_aggregate_update(&self.kernel, runtime, &binding, state, batch)
+            .map_err(crate::map_jit_err)?
+            .is_some()
+        {
+            return Ok(());
+        }
+
+        runtime
+            .flush_dense_state(state)
+            .map_err(crate::map_jit_err)?;
+        runtime
+            .accumulate_bound(state, batch, &binding)
+            .map_err(crate::map_jit_err)
     }
 }
 

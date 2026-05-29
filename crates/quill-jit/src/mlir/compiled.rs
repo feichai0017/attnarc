@@ -1,16 +1,7 @@
-use crate::{FilterSumValue, JitError, JitResult, JitType, MlirColumn, MlirModule};
+use crate::{AggregateFunc, FilterSumValue, JitError, JitResult, JitType, MlirColumn, MlirModule};
 
 use melior::{ir::Module, pass, ExecutionEngine};
-
-pub(super) struct CompiledI64Predicate {
-    symbol: String,
-    engine: ExecutionEngine,
-}
-
-pub struct CompiledI64Filter {
-    symbol: String,
-    engine: ExecutionEngine,
-}
+use quill_runtime::GroupAggregateStateField;
 
 pub struct CompiledRecordPipeline {
     symbol: String,
@@ -26,6 +17,14 @@ pub struct CompiledPlainSum {
     output_type: JitType,
 }
 
+pub struct CompiledGroupAggregateUpdate {
+    symbol: String,
+    engine: ExecutionEngine,
+    columns: Vec<MlirColumn>,
+    aggregate_funcs: Vec<AggregateFunc>,
+    state_types: Vec<JitType>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum FixedColumnInput<'a> {
     Date32 { index: usize, values: &'a [i32] },
@@ -39,62 +38,6 @@ pub enum RecordPipelineOutput<'a> {
     Int64 { values: &'a mut [i64] },
     Float64 { values: &'a mut [f64] },
     Decimal128 { values: &'a mut [i128] },
-}
-
-impl CompiledI64Predicate {
-    pub(super) fn invoke(&self, value: i64) -> JitResult<bool> {
-        let mut argument = value;
-        let mut result = -1_i32;
-        unsafe {
-            self.engine
-                .invoke_packed(
-                    &self.symbol,
-                    &mut [
-                        &mut argument as *mut i64 as *mut (),
-                        &mut result as *mut i32 as *mut (),
-                    ],
-                )
-                .map_err(|err| JitError::Backend(format!("MLIR invocation failed: {err:?}")))?;
-        }
-        Ok(result != 0)
-    }
-}
-
-impl CompiledI64Filter {
-    pub fn invoke(&self, values: &[i64], output: &mut [u8]) -> JitResult<()> {
-        if output.len() < values.len() {
-            return Err(JitError::Backend(format!(
-                "compiled filter output len {} is smaller than input len {}",
-                output.len(),
-                values.len()
-            )));
-        }
-
-        let mut len = values.len() as i64;
-        let mut values_ptr = values.as_ptr();
-        let mut output_ptr = output.as_mut_ptr();
-        let mut result = -1_i32;
-        unsafe {
-            self.engine
-                .invoke_packed(
-                    &self.symbol,
-                    &mut [
-                        &mut len as *mut i64 as *mut (),
-                        &mut values_ptr as *mut *const i64 as *mut (),
-                        &mut output_ptr as *mut *mut u8 as *mut (),
-                        &mut result as *mut i32 as *mut (),
-                    ],
-                )
-                .map_err(|err| JitError::Backend(format!("MLIR invocation failed: {err:?}")))?;
-        }
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(JitError::Backend(format!(
-                "compiled filter returned status {result}"
-            )))
-        }
-    }
 }
 
 impl CompiledRecordPipeline {
@@ -246,6 +189,124 @@ impl CompiledPlainSum {
     }
 }
 
+impl CompiledGroupAggregateUpdate {
+    pub fn invoke(
+        &self,
+        group_ids: &[i64],
+        inputs: &[FixedColumnInput<'_>],
+        state_fields: &mut [GroupAggregateStateField],
+    ) -> JitResult<()> {
+        if state_fields.len() != self.state_types.len() {
+            return Err(JitError::Backend(format!(
+                "compiled group aggregate expected {} state fields, got {}",
+                self.state_types.len(),
+                state_fields.len()
+            )));
+        }
+        for (index, (field, ty)) in state_fields.iter().zip(&self.state_types).enumerate() {
+            if field.ty() != *ty {
+                return Err(JitError::Backend(format!(
+                    "compiled group aggregate state field {index} has incompatible type"
+                )));
+            }
+        }
+
+        let mut input_len = Some(group_ids.len());
+        let mut input_ptrs = Vec::with_capacity(self.columns.len());
+        for column in &self.columns {
+            let input = inputs
+                .iter()
+                .find(|input| input.index() == column.index)
+                .ok_or_else(|| {
+                    JitError::Backend(format!(
+                        "compiled group aggregate missing input column {}",
+                        column.index
+                    ))
+                })?;
+            if !input.matches_type(column.ty) {
+                return Err(JitError::Backend(format!(
+                    "compiled group aggregate input column {} has incompatible type",
+                    column.index
+                )));
+            }
+            match input_len {
+                Some(expected) if expected != input.len() => {
+                    return Err(JitError::Backend(format!(
+                        "compiled group aggregate input column {} len {} does not match len {}",
+                        column.index,
+                        input.len(),
+                        expected
+                    )));
+                }
+                Some(_) => {}
+                None => input_len = Some(input.len()),
+            }
+            input_ptrs.push(input.ptr());
+        }
+
+        let max_group_id = group_ids
+            .iter()
+            .copied()
+            .filter(|group_id| *group_id >= 0)
+            .max();
+        if let Some(max_group_id) = max_group_id {
+            let max_group_id = usize::try_from(max_group_id)
+                .map_err(|_| JitError::Backend("group id does not fit in usize".to_string()))?;
+            for (index, field) in state_fields.iter().enumerate() {
+                if field.len() <= max_group_id {
+                    return Err(JitError::Backend(format!(
+                        "compiled group aggregate state field {index} len {} cannot hold group id {max_group_id}",
+                        field.len()
+                    )));
+                }
+            }
+        }
+
+        let mut len = group_ids.len() as i64;
+        let mut group_ids_ptr = group_ids.as_ptr();
+        let mut state_ptrs = state_fields
+            .iter_mut()
+            .map(GroupAggregateStateField::values_ptr)
+            .collect::<Vec<_>>();
+        let mut valid_ptrs = state_fields
+            .iter_mut()
+            .map(GroupAggregateStateField::valid_ptr)
+            .collect::<Vec<_>>();
+        let mut result = -1_i32;
+        let mut packed_args =
+            Vec::with_capacity(2 + input_ptrs.len() + state_ptrs.len() + valid_ptrs.len() + 1);
+        packed_args.push(&mut len as *mut i64 as *mut ());
+        packed_args.push(&mut group_ids_ptr as *mut *const i64 as *mut ());
+        for ptr in &mut input_ptrs {
+            packed_args.push(ptr as *mut *const () as *mut ());
+        }
+        for ptr in &mut state_ptrs {
+            packed_args.push(ptr as *mut *mut () as *mut ());
+        }
+        for ptr in &mut valid_ptrs {
+            packed_args.push(ptr as *mut *mut u8 as *mut ());
+        }
+        packed_args.push(&mut result as *mut i32 as *mut ());
+
+        unsafe {
+            self.engine
+                .invoke_packed(&self.symbol, &mut packed_args)
+                .map_err(|err| JitError::Backend(format!("MLIR invocation failed: {err:?}")))?;
+        }
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(JitError::Backend(format!(
+                "compiled group aggregate returned status {result}"
+            )))
+        }
+    }
+
+    pub fn aggregate_funcs(&self) -> &[AggregateFunc] {
+        &self.aggregate_funcs
+    }
+}
+
 impl FixedColumnInput<'_> {
     fn index(&self) -> usize {
         match self {
@@ -384,24 +445,6 @@ fn invoke_plain_sum(
     }
 }
 
-pub(super) fn compile_i64_predicate(compiled: &MlirModule) -> JitResult<CompiledI64Predicate> {
-    Ok(CompiledI64Predicate {
-        symbol: compiled.symbol.clone(),
-        engine: compile_engine(compiled)?,
-    })
-}
-
-pub(super) fn invoke_i64_predicate(compiled: &MlirModule, value: i64) -> JitResult<bool> {
-    compile_i64_predicate(compiled)?.invoke(value)
-}
-
-pub fn compile_i64_filter(compiled: &MlirModule) -> JitResult<CompiledI64Filter> {
-    Ok(CompiledI64Filter {
-        symbol: compiled.symbol.clone(),
-        engine: compile_engine(compiled)?,
-    })
-}
-
 pub fn compile_record_pipeline(
     compiled: &MlirModule,
     columns: Vec<MlirColumn>,
@@ -425,6 +468,21 @@ pub fn compile_plain_sum(
         engine: compile_engine(compiled)?,
         columns,
         output_type,
+    })
+}
+
+pub fn compile_group_aggregate_update(
+    compiled: &MlirModule,
+    columns: Vec<MlirColumn>,
+    aggregate_funcs: Vec<AggregateFunc>,
+    state_types: Vec<JitType>,
+) -> JitResult<CompiledGroupAggregateUpdate> {
+    Ok(CompiledGroupAggregateUpdate {
+        symbol: compiled.symbol.clone(),
+        engine: compile_engine(compiled)?,
+        columns,
+        aggregate_funcs,
+        state_types,
     })
 }
 

@@ -1,6 +1,7 @@
 #include "Quill/IR/Dialect.h"
 
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/ADT/SmallVector.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/DialectImplementation.h"
@@ -106,19 +107,53 @@ LogicalResult PlainSumSinkOp::verify() {
   return success();
 }
 
-LogicalResult GroupAggregateSinkOp::verify() {
+LogicalResult GroupIdsOp::verify() {
+  if (failed(verifySingleRowRegion(getOperation(), getKeys(), "keys")))
+    return failure();
+
+  auto yield = cast<YieldOp>(getKeys().front().back());
+  if (yield.getValues().empty())
+    return emitOpError("keys region must yield at least one key value");
+
+  return success();
+}
+
+LogicalResult GroupUpdateSinkOp::verify() {
   if (failed(verifySingleRowRegion(getOperation(), getState(), "state")))
     return failure();
 
   auto yield = cast<YieldOp>(getState().front().back());
-  if (getKeyCount() <= 0)
-    return emitOpError("key_count must be positive");
+  ArrayAttr funcs = getAggregateFuncs();
+  if (funcs.empty())
+    return emitOpError("aggregate_funcs must contain at least one function");
 
-  size_t keyCount = static_cast<size_t>(getKeyCount());
-  if (yield.getValues().size() <= keyCount)
-    return emitOpError("state region must yield at least one key and one aggregate value");
+  ArrayAttr stateTypes = getStateTypes();
+  if (stateTypes.empty())
+    return emitOpError("state_types must contain at least one state field");
 
-  for (Value value : yield.getValues().drop_front(keyCount)) {
+  for (Attribute attr : funcs) {
+    auto value = dyn_cast<StringAttr>(attr);
+    if (!value)
+      return emitOpError("aggregate_funcs must contain string attributes");
+    StringRef func = value.getValue();
+    if (func != "sum" && func != "count" && func != "avg" &&
+        func != "min" && func != "max")
+      return emitOpError("unsupported aggregate function ") << func;
+  }
+
+  for (Attribute attr : stateTypes) {
+    auto value = dyn_cast<StringAttr>(attr);
+    if (!value)
+      return emitOpError("state_types must contain string attributes");
+    StringRef ty = value.getValue();
+    if (ty != "i64" && ty != "u64" && ty != "f64" && ty != "i128")
+      return emitOpError("unsupported aggregate state type ") << ty;
+  }
+
+  if (yield.getValues().size() != funcs.size())
+    return emitOpError("state region must yield one value per aggregate function");
+
+  for (Value value : yield.getValues()) {
     Type type = value.getType();
     if (!type.isIntOrIndexOrFloat())
       return emitOpError("aggregate state values must be fixed-width scalar types");

@@ -451,7 +451,7 @@ async fn debug_trace_reports_group_aggregate_candidate() {
 }
 
 #[tokio::test]
-async fn group_aggregate_runtime_executes_partial_pipeline() {
+async fn group_aggregate_mlir_executes_dense_update_pipeline() {
     let db = Database::new_temp().expect("database");
     let schema = Arc::new(Schema::new(vec![
         Field::new("k", DataType::Int64, false),
@@ -516,7 +516,7 @@ async fn group_aggregate_runtime_executes_partial_pipeline() {
                 && candidate.source == "arrow_batch"
                 && candidate.stages == vec!["filter"]
                 && candidate.sink == "group_aggregate"
-                && candidate.backend.as_deref() == Some("quill-runtime")
+                && candidate.backend.as_deref() == Some("mlir")
                 && candidate.reason == "compiled"),
         "{:?}",
         trace.pipeline_candidates
@@ -524,7 +524,7 @@ async fn group_aggregate_runtime_executes_partial_pipeline() {
 }
 
 #[tokio::test]
-async fn string_group_keys_use_runtime_group_aggregate_boundary() {
+async fn string_group_keys_use_mlir_dense_update_boundary() {
     let db = Database::new_temp().expect("database");
     let schema = Arc::new(Schema::new(vec![
         Field::new("flag", DataType::Utf8, false),
@@ -568,7 +568,7 @@ async fn string_group_keys_use_runtime_group_aggregate_boundary() {
                 && candidate.compiled
                 && candidate.source == "arrow_batch"
                 && candidate.sink == "group_aggregate"
-                && candidate.backend.as_deref() == Some("quill-runtime")
+                && candidate.backend.as_deref() == Some("mlir")
                 && candidate.reason == "compiled"),
         "{:?}",
         trace.pipeline_candidates
@@ -635,7 +635,7 @@ async fn avg_group_aggregate_uses_partial_state_pipeline() {
                 && candidate.compiled
                 && candidate.source == "arrow_batch"
                 && candidate.sink == "group_aggregate"
-                && candidate.backend.as_deref() == Some("quill-runtime")
+                && candidate.backend.as_deref() == Some("mlir")
                 && candidate.reason == "compiled"),
         "{:?}",
         trace.pipeline_candidates
@@ -713,7 +713,7 @@ async fn q1_shaped_composite_group_aggregate_uses_partial_state_pipeline() {
                 && candidate.source == "arrow_batch"
                 && candidate.stages == vec!["filter"]
                 && candidate.sink == "group_aggregate"
-                && candidate.backend.as_deref() == Some("quill-runtime")
+                && candidate.backend.as_deref() == Some("mlir")
                 && candidate.reason == "compiled"),
         "{:?}",
         trace.pipeline_candidates
@@ -809,7 +809,7 @@ async fn q1_decimal_group_aggregate_shape_uses_partial_state_pipeline() {
                 && candidate.source == "arrow_batch"
                 && candidate.stages == vec!["filter"]
                 && candidate.sink == "group_aggregate"
-                && candidate.backend.as_deref() == Some("quill-runtime")
+                && candidate.backend.as_deref() == Some("mlir")
                 && candidate.reason == "compiled"),
         "{:?}",
         trace.pipeline_candidates

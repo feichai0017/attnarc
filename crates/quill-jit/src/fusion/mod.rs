@@ -25,7 +25,7 @@ mod tests {
             ids,
             vec![
                 "filter_project_record",
-                "filter_plain_sum",
+                "filter_plain_aggregate",
                 "filter_group_aggregate",
                 "group_aggregate"
             ]
@@ -57,7 +57,7 @@ mod tests {
         let matched = FusionRegistry::builtin()
             .match_pipeline(&pipeline)
             .expect("fusion match");
-        assert_eq!(matched.pattern.lowering, FusionLoweringKind::PlainSum);
+        assert_eq!(matched.pattern.lowering, FusionLoweringKind::PlainAggregate);
         assert!(matches!(
             matched.lowering,
             PipelineLowering::PlainSum { .. }

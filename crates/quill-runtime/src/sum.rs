@@ -4,13 +4,12 @@ use quill_plan::{JitError, JitExpr, JitResult, JitType};
 
 use super::eval::{ensure_supported_expr, eval_expr};
 use super::value::Scalar;
-use super::{BatchView, PipelineSpec};
+use super::BatchView;
 
 #[derive(Debug, Clone)]
 pub struct FilterSumKernel {
     predicate: JitExpr,
     measure: JitExpr,
-    spec: Option<PipelineSpec>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -35,12 +34,7 @@ impl FilterSumKernel {
         }
         ensure_supported_expr(&predicate)?;
         ensure_supported_expr(&measure)?;
-        let spec = PipelineSpec::filter_sum(&predicate, &measure);
-        Ok(Self {
-            predicate,
-            measure,
-            spec,
-        })
+        Ok(Self { predicate, measure })
     }
 
     pub fn predicate(&self) -> &JitExpr {
@@ -49,10 +43,6 @@ impl FilterSumKernel {
 
     pub fn measure(&self) -> &JitExpr {
         &self.measure
-    }
-
-    pub fn spec(&self) -> Option<&PipelineSpec> {
-        self.spec.as_ref()
     }
 
     pub fn execute(&self, batch: &RecordBatch) -> JitResult<FilterSumValue> {

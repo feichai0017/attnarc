@@ -9,15 +9,18 @@ use quill_plan::{JitError, JitResult};
 type Result<T> = JitResult<T>;
 
 use crate::{
-    CompiledKernel, CompiledPlainSum, CompiledRecordPipeline, FilterProjectKernel, FilterSumKernel,
-    FilterSumValue, FixedColumnInput, JitType, MlirBackend, MlirColumn, PipelineSpec,
-    RecordPipelineOutput,
+    CompiledGroupAggregateUpdate, CompiledKernel, CompiledPlainSum, CompiledRecordPipeline,
+    FilterProjectKernel, FilterSumKernel, FilterSumValue, FixedColumnInput, JitType, MlirBackend,
+    MlirColumn, PipelineSpec, RecordPipelineOutput,
 };
+use quill_runtime::{GroupAggregateBatchBinding, GroupAggregateKernel, GroupAggregateState};
 
 thread_local! {
     static RECORD_PIPELINE_CACHE: RefCell<HashMap<String, CompiledRecordPipeline>> =
         RefCell::new(HashMap::new());
     static PLAIN_SUM_CACHE: RefCell<HashMap<String, CompiledPlainSum>> =
+        RefCell::new(HashMap::new());
+    static GROUP_AGGREGATE_CACHE: RefCell<HashMap<String, CompiledGroupAggregateUpdate>> =
         RefCell::new(HashMap::new());
 }
 
@@ -96,6 +99,56 @@ pub fn execute_filter_sum(
     }
 }
 
+pub fn execute_group_aggregate_update(
+    kernel: &CompiledKernel,
+    runtime: &GroupAggregateKernel,
+    binding: &GroupAggregateBatchBinding,
+    state: &mut GroupAggregateState,
+    batch: &RecordBatch,
+) -> Result<Option<()>> {
+    if !kernel.executable || kernel.backend != "mlir" {
+        return Ok(None);
+    }
+
+    let PipelineSpec::GroupAggregate { columns, .. } = &kernel.spec else {
+        return Ok(None);
+    };
+    let Some(inputs) = fixed_inputs(batch, columns)? else {
+        return Ok(None);
+    };
+    let dense = match runtime.dense_state_mut(state) {
+        Ok(dense) => dense,
+        Err(_) => return Ok(None),
+    };
+    if dense.group_count() == 0 || binding.selected_rows() == 0 {
+        return Ok(Some(()));
+    }
+
+    let cache_key = group_aggregate_cache_key(runtime);
+    let invoked = GROUP_AGGREGATE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if !cache.contains_key(&cache_key) {
+            let compiled = match MlirBackend::new()
+                .compile_group_aggregate_update(runtime.keys(), runtime.aggregates())
+            {
+                Ok(compiled) => compiled,
+                Err(_) => return Ok(false),
+            };
+            cache.insert(cache_key.clone(), compiled);
+        }
+        cache
+            .get(&cache_key)
+            .expect("compiled kernel was inserted")
+            .invoke(binding.group_ids(), &inputs, dense.fields_mut())
+            .map(|()| true)
+    })?;
+    if !invoked {
+        return Ok(None);
+    }
+
+    Ok(Some(()))
+}
+
 fn filter_project_cache_key(runtime: &FilterProjectKernel) -> String {
     format!("{:?}|{:?}", runtime.predicate(), runtime.projections())
 }
@@ -135,6 +188,10 @@ fn execute_plain_sum(
 
 fn filter_sum_cache_key(runtime: &FilterSumKernel) -> String {
     format!("{:?}|{:?}", runtime.predicate(), runtime.measure())
+}
+
+fn group_aggregate_cache_key(runtime: &GroupAggregateKernel) -> String {
+    format!("{:?}|{:?}", runtime.keys(), runtime.aggregates())
 }
 
 fn fixed_inputs<'a>(

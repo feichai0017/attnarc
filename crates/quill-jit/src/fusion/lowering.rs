@@ -44,7 +44,7 @@ pub(crate) fn extract_lowering(
 ) -> Option<PipelineLowering> {
     match kind {
         FusionLoweringKind::Record => extract_record_lowering(graph),
-        FusionLoweringKind::PlainSum => extract_plain_sum_lowering(graph),
+        FusionLoweringKind::PlainAggregate => extract_plain_sum_lowering(graph),
         FusionLoweringKind::GroupAggregate => extract_group_aggregate_lowering(graph),
     }
 }

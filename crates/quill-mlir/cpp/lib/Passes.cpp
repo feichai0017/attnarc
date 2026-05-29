@@ -26,9 +26,17 @@ struct ColumnInfo {
   mlir::Value pointer;
 };
 
+struct StateFieldInfo {
+  llvm::StringRef kind;
+  mlir::Type type;
+  mlir::Value values;
+  mlir::Value valid;
+};
+
 static mlir::LogicalResult collectColumns(mlir::Region &region,
                                           std::map<int64_t, mlir::Type> &columns,
-                                          mlir::Operation *owner) {
+                                          mlir::Operation *owner,
+                                          bool requireColumn = true) {
   auto walkResult = region.walk([&](mlir::quill::ColumnOp column) {
     int64_t index = static_cast<int64_t>(column.getIndex());
     mlir::Type type = column.getResult().getType();
@@ -42,7 +50,7 @@ static mlir::LogicalResult collectColumns(mlir::Region &region,
   });
   if (walkResult.wasInterrupted())
     return mlir::failure();
-  if (columns.empty())
+  if (requireColumn && columns.empty())
     return owner->emitOpError("lowering requires at least one column access");
   return mlir::success();
 }
@@ -277,6 +285,189 @@ static mlir::Value addValues(mlir::OpBuilder &builder, mlir::Location loc,
   return builder.create<mlir::arith::AddIOp>(loc, lhs, rhs);
 }
 
+static mlir::Value compareForMinMax(mlir::OpBuilder &builder,
+                                    mlir::Location loc, llvm::StringRef kind,
+                                    mlir::Value candidate,
+                                    mlir::Value current, bool isMin) {
+  mlir::Type type = candidate.getType();
+  if (llvm::isa<mlir::FloatType>(type)) {
+    auto predicate = isMin ? mlir::arith::CmpFPredicate::OLT
+                           : mlir::arith::CmpFPredicate::OGT;
+    return builder.create<mlir::arith::CmpFOp>(loc, predicate, candidate,
+                                               current);
+  }
+
+  mlir::arith::CmpIPredicate predicate;
+  if (kind == "u64")
+    predicate = isMin ? mlir::arith::CmpIPredicate::ult
+                      : mlir::arith::CmpIPredicate::ugt;
+  else
+    predicate = isMin ? mlir::arith::CmpIPredicate::slt
+                      : mlir::arith::CmpIPredicate::sgt;
+  return builder.create<mlir::arith::CmpIOp>(loc, predicate, candidate,
+                                             current);
+}
+
+static mlir::Type stateTypeFromName(mlir::OpBuilder &builder,
+                                    llvm::StringRef name) {
+  if (name == "i64" || name == "u64")
+    return builder.getI64Type();
+  if (name == "f64")
+    return builder.getF64Type();
+  if (name == "i128")
+    return builder.getIntegerType(128);
+  return {};
+}
+
+static mlir::Value stateValuePtr(mlir::OpBuilder &builder, mlir::Location loc,
+                                 const StateFieldInfo &field,
+                                 mlir::Value groupId) {
+  auto ptrType = mlir::LLVM::LLVMPointerType::get(builder.getContext());
+  return builder.create<mlir::LLVM::GEPOp>(
+      loc, ptrType, field.type, field.values,
+      llvm::SmallVector<mlir::LLVM::GEPArg>{groupId});
+}
+
+static mlir::Value stateValidPtr(mlir::OpBuilder &builder, mlir::Location loc,
+                                 const StateFieldInfo &field,
+                                 mlir::Value groupId) {
+  auto ptrType = mlir::LLVM::LLVMPointerType::get(builder.getContext());
+  return builder.create<mlir::LLVM::GEPOp>(
+      loc, ptrType, builder.getI8Type(), field.valid,
+      llvm::SmallVector<mlir::LLVM::GEPArg>{groupId});
+}
+
+static mlir::Value loadStateValue(mlir::OpBuilder &builder, mlir::Location loc,
+                                  const StateFieldInfo &field,
+                                  mlir::Value groupId) {
+  return builder.create<mlir::LLVM::LoadOp>(
+      loc, field.type, stateValuePtr(builder, loc, field, groupId));
+}
+
+static mlir::Value loadStateValid(mlir::OpBuilder &builder, mlir::Location loc,
+                                  const StateFieldInfo &field,
+                                  mlir::Value groupId) {
+  return builder.create<mlir::LLVM::LoadOp>(
+      loc, builder.getI8Type(), stateValidPtr(builder, loc, field, groupId));
+}
+
+static void storeStateValue(mlir::OpBuilder &builder, mlir::Location loc,
+                            const StateFieldInfo &field, mlir::Value groupId,
+                            mlir::Value value) {
+  builder.create<mlir::LLVM::StoreOp>(
+      loc, value, stateValuePtr(builder, loc, field, groupId));
+}
+
+static void storeStateValid(mlir::OpBuilder &builder, mlir::Location loc,
+                            const StateFieldInfo &field, mlir::Value groupId) {
+  mlir::Value one = builder.create<mlir::arith::ConstantIntOp>(loc, 1, 8);
+  builder.create<mlir::LLVM::StoreOp>(
+      loc, one, stateValidPtr(builder, loc, field, groupId));
+}
+
+static void updateNullableValue(mlir::OpBuilder &builder, mlir::Location loc,
+                                const StateFieldInfo &field,
+                                mlir::Value groupId, mlir::Value value,
+                                bool addToCurrent) {
+  mlir::Value valid = loadStateValid(builder, loc, field, groupId);
+  mlir::Value zeroI8 = builder.create<mlir::arith::ConstantIntOp>(loc, 0, 8);
+  mlir::Value isValid = builder.create<mlir::arith::CmpIOp>(
+      loc, mlir::arith::CmpIPredicate::ne, valid, zeroI8);
+  auto branch = builder.create<mlir::scf::IfOp>(
+      loc, mlir::TypeRange{field.type}, isValid, true);
+  {
+    mlir::OpBuilder thenBuilder = branch.getThenBodyBuilder();
+    mlir::Value current = loadStateValue(thenBuilder, loc, field, groupId);
+    mlir::Value next = addToCurrent ? addValues(thenBuilder, loc, current, value)
+                                    : value;
+    thenBuilder.create<mlir::scf::YieldOp>(loc, mlir::ValueRange{next});
+  }
+  {
+    mlir::OpBuilder elseBuilder = branch.getElseBodyBuilder();
+    elseBuilder.create<mlir::scf::YieldOp>(loc, mlir::ValueRange{value});
+  }
+  storeStateValue(builder, loc, field, groupId, branch.getResult(0));
+  storeStateValid(builder, loc, field, groupId);
+}
+
+static void updateMinMaxValue(mlir::OpBuilder &builder, mlir::Location loc,
+                              const StateFieldInfo &field, mlir::Value groupId,
+                              mlir::Value value, bool isMin) {
+  mlir::Value current = loadStateValue(builder, loc, field, groupId);
+  mlir::Value valid = loadStateValid(builder, loc, field, groupId);
+  mlir::Value zeroI8 = builder.create<mlir::arith::ConstantIntOp>(loc, 0, 8);
+  mlir::Value invalid = builder.create<mlir::arith::CmpIOp>(
+      loc, mlir::arith::CmpIPredicate::eq, valid, zeroI8);
+  mlir::Value better =
+      compareForMinMax(builder, loc, field.kind, value, current, isMin);
+  mlir::Value replace =
+      builder.create<mlir::arith::OrIOp>(loc, invalid, better);
+  auto branch = builder.create<mlir::scf::IfOp>(
+      loc, mlir::TypeRange{builder.getI32Type()}, replace, true);
+  mlir::OpBuilder thenBuilder = branch.getThenBodyBuilder();
+  storeStateValue(thenBuilder, loc, field, groupId, value);
+  storeStateValid(thenBuilder, loc, field, groupId);
+  mlir::Value zeroI32 = thenBuilder.create<mlir::arith::ConstantIntOp>(loc, 0, 32);
+  thenBuilder.create<mlir::scf::YieldOp>(loc, mlir::ValueRange{zeroI32});
+  mlir::OpBuilder elseBuilder = branch.getElseBodyBuilder();
+  mlir::Value elseZeroI32 =
+      elseBuilder.create<mlir::arith::ConstantIntOp>(loc, 0, 32);
+  elseBuilder.create<mlir::scf::YieldOp>(loc, mlir::ValueRange{elseZeroI32});
+}
+
+static mlir::LogicalResult updateAggregateState(
+    mlir::OpBuilder &builder, mlir::Location loc, llvm::StringRef func,
+    mlir::Value measure, llvm::SmallVectorImpl<StateFieldInfo> &states,
+    size_t &stateIndex, mlir::Value groupId) {
+  if (func == "sum") {
+    if (stateIndex >= states.size())
+      return mlir::failure();
+    updateNullableValue(builder, loc, states[stateIndex++], groupId, measure,
+                        true);
+    return mlir::success();
+  }
+  if (func == "count") {
+    if (stateIndex >= states.size())
+      return mlir::failure();
+    const StateFieldInfo &field = states[stateIndex++];
+    mlir::Value current = loadStateValue(builder, loc, field, groupId);
+    auto integerType = llvm::dyn_cast<mlir::IntegerType>(field.type);
+    if (!integerType)
+      return mlir::failure();
+    mlir::Value one = builder.create<mlir::arith::ConstantIntOp>(
+        loc, 1, integerType.getWidth());
+    mlir::Value next = builder.create<mlir::arith::AddIOp>(loc, current, one);
+    storeStateValue(builder, loc, field, groupId, next);
+    storeStateValid(builder, loc, field, groupId);
+    return mlir::success();
+  }
+  if (func == "avg") {
+    if (stateIndex + 1 >= states.size())
+      return mlir::failure();
+    const StateFieldInfo &countField = states[stateIndex++];
+    mlir::Value current = loadStateValue(builder, loc, countField, groupId);
+    auto integerType = llvm::dyn_cast<mlir::IntegerType>(countField.type);
+    if (!integerType)
+      return mlir::failure();
+    mlir::Value one = builder.create<mlir::arith::ConstantIntOp>(
+        loc, 1, integerType.getWidth());
+    mlir::Value next = builder.create<mlir::arith::AddIOp>(loc, current, one);
+    storeStateValue(builder, loc, countField, groupId, next);
+    storeStateValid(builder, loc, countField, groupId);
+    updateNullableValue(builder, loc, states[stateIndex++], groupId, measure,
+                        true);
+    return mlir::success();
+  }
+  if (func == "min" || func == "max") {
+    if (stateIndex >= states.size())
+      return mlir::failure();
+    updateMinMaxValue(builder, loc, states[stateIndex++], groupId, measure,
+                      func == "min");
+    return mlir::success();
+  }
+  return mlir::failure();
+}
+
 static mlir::LogicalResult lowerFilterPlainSum(mlir::func::FuncOp func) {
   if (func.isExternal() || !llvm::hasSingleElement(func.getBody()))
     return mlir::failure();
@@ -409,6 +600,161 @@ static mlir::LogicalResult lowerFilterPlainSum(mlir::func::FuncOp func) {
   return mlir::success();
 }
 
+static mlir::LogicalResult lowerGroupAggregateUpdate(mlir::func::FuncOp func) {
+  if (func.isExternal() || !llvm::hasSingleElement(func.getBody()))
+    return mlir::failure();
+
+  mlir::quill::GroupUpdateSinkOp sink;
+  func.walk([&](mlir::quill::GroupUpdateSinkOp op) {
+    if (!sink)
+      sink = op;
+  });
+  if (!sink)
+    return mlir::failure();
+
+  std::map<int64_t, mlir::Type> columnTypes;
+  if (mlir::failed(
+          collectColumns(sink.getState(), columnTypes, sink, false)))
+    return mlir::failure();
+
+  mlir::Block &stateBlock = sink.getState().front();
+  auto stateYield =
+      llvm::dyn_cast<mlir::quill::YieldOp>(stateBlock.getTerminator());
+  if (!stateYield || stateYield.getValues().empty())
+    return sink.emitOpError("state region must yield at least one aggregate value");
+
+  llvm::SmallVector<llvm::StringRef> funcs;
+  for (mlir::Attribute attr : sink.getAggregateFuncs())
+    funcs.push_back(llvm::cast<mlir::StringAttr>(attr).getValue());
+  if (funcs.size() != stateYield.getValues().size())
+    return sink.emitOpError("state region must yield one value per aggregate function");
+
+  llvm::SmallVector<llvm::StringRef> stateKinds;
+  for (mlir::Attribute attr : sink.getStateTypes())
+    stateKinds.push_back(llvm::cast<mlir::StringAttr>(attr).getValue());
+  if (stateKinds.empty())
+    return sink.emitOpError("state_types must not be empty");
+
+  mlir::Region stateRegion;
+  mlir::IRMapping stateMapping;
+  sink.getState().cloneInto(&stateRegion, stateMapping);
+
+  mlir::MLIRContext *context = func.getContext();
+  mlir::OpBuilder builder(context);
+  mlir::Location loc = func.getLoc();
+  auto i64Type = builder.getI64Type();
+  auto i32Type = builder.getI32Type();
+  auto ptrType = mlir::LLVM::LLVMPointerType::get(context);
+
+  llvm::SmallVector<mlir::Type> stateTypes;
+  for (llvm::StringRef kind : stateKinds) {
+    mlir::Type type = stateTypeFromName(builder, kind);
+    if (!type)
+      return sink.emitOpError("unsupported state type ") << kind;
+    stateTypes.push_back(type);
+  }
+
+  llvm::SmallVector<mlir::Type> inputTypes;
+  inputTypes.push_back(i64Type);
+  inputTypes.push_back(ptrType);
+  for (size_t i = 0; i < columnTypes.size(); ++i)
+    inputTypes.push_back(ptrType);
+  for (size_t i = 0; i < stateTypes.size(); ++i)
+    inputTypes.push_back(ptrType);
+  for (size_t i = 0; i < stateTypes.size(); ++i)
+    inputTypes.push_back(ptrType);
+
+  func.eraseBody();
+  func.setFunctionType(mlir::FunctionType::get(context, inputTypes, i32Type));
+  func->setAttr("llvm.emit_c_interface", builder.getUnitAttr());
+  mlir::Block *entry = func.addEntryBlock();
+  builder.setInsertionPointToStart(entry);
+
+  mlir::Value len = entry->getArgument(0);
+  mlir::Value groupIds = entry->getArgument(1);
+  llvm::SmallVector<ColumnInfo> columns;
+  size_t argIndex = 2;
+  for (const auto &[index, type] : columnTypes)
+    columns.push_back(ColumnInfo{index, type, entry->getArgument(argIndex++)});
+
+  llvm::SmallVector<StateFieldInfo> states;
+  states.reserve(stateTypes.size());
+  for (size_t i = 0; i < stateTypes.size(); ++i)
+    states.push_back(
+        StateFieldInfo{stateKinds[i], stateTypes[i], entry->getArgument(argIndex++), {}});
+  for (size_t i = 0; i < stateTypes.size(); ++i)
+    states[i].valid = entry->getArgument(argIndex++);
+
+  mlir::Value zeroI64 = builder.create<mlir::arith::ConstantIntOp>(loc, 0, 64);
+  mlir::Value oneI64 = builder.create<mlir::arith::ConstantIntOp>(loc, 1, 64);
+
+  bool cloneFailed = false;
+  bool updateFailed = false;
+  builder.create<mlir::scf::ForOp>(
+      loc, zeroI64, len, oneI64, mlir::ValueRange{},
+      [&](mlir::OpBuilder &bodyBuilder, mlir::Location bodyLoc,
+          mlir::Value iv, mlir::ValueRange) {
+        auto groupIdPtr = bodyBuilder.create<mlir::LLVM::GEPOp>(
+            bodyLoc, ptrType, i64Type, groupIds,
+            llvm::SmallVector<mlir::LLVM::GEPArg>{iv});
+        mlir::Value groupId =
+            bodyBuilder.create<mlir::LLVM::LoadOp>(bodyLoc, i64Type, groupIdPtr);
+        mlir::Value selected = bodyBuilder.create<mlir::arith::CmpIOp>(
+            bodyLoc, mlir::arith::CmpIPredicate::sge, groupId, zeroI64);
+
+        auto branch = bodyBuilder.create<mlir::scf::IfOp>(
+            bodyLoc, mlir::TypeRange{i32Type}, selected, true);
+        mlir::OpBuilder thenBuilder = branch.getThenBodyBuilder();
+
+        llvm::DenseMap<int64_t, mlir::Value> loadedColumns;
+        for (const ColumnInfo &column : columns)
+          loadedColumns.try_emplace(column.index,
+                                    loadColumn(thenBuilder, bodyLoc, iv, column));
+
+        llvm::SmallVector<mlir::Value> measures;
+        if (mlir::failed(cloneRegionValues(thenBuilder, stateRegion,
+                                           loadedColumns, func.getOperation(),
+                                           measures))) {
+          cloneFailed = true;
+          mlir::Value zeroI32 =
+              thenBuilder.create<mlir::arith::ConstantIntOp>(bodyLoc, 0, 32);
+          thenBuilder.create<mlir::scf::YieldOp>(bodyLoc,
+                                                 mlir::ValueRange{zeroI32});
+          bodyBuilder.create<mlir::scf::YieldOp>(bodyLoc);
+          return;
+        }
+
+        size_t stateIndex = 0;
+        for (size_t i = 0; i < funcs.size(); ++i) {
+          if (mlir::failed(updateAggregateState(thenBuilder, bodyLoc, funcs[i],
+                                                measures[i], states,
+                                                stateIndex, groupId))) {
+            updateFailed = true;
+            break;
+          }
+        }
+        if (stateIndex != states.size())
+          updateFailed = true;
+
+        mlir::Value zeroI32 =
+            thenBuilder.create<mlir::arith::ConstantIntOp>(bodyLoc, 0, 32);
+        thenBuilder.create<mlir::scf::YieldOp>(bodyLoc,
+                                               mlir::ValueRange{zeroI32});
+        mlir::OpBuilder elseBuilder = branch.getElseBodyBuilder();
+        mlir::Value elseZeroI32 =
+            elseBuilder.create<mlir::arith::ConstantIntOp>(bodyLoc, 0, 32);
+        elseBuilder.create<mlir::scf::YieldOp>(bodyLoc,
+                                               mlir::ValueRange{elseZeroI32});
+        bodyBuilder.create<mlir::scf::YieldOp>(bodyLoc);
+      });
+  if (cloneFailed || updateFailed)
+    return mlir::failure();
+
+  mlir::Value ok = builder.create<mlir::arith::ConstantIntOp>(loc, 0, 32);
+  builder.create<mlir::func::ReturnOp>(loc, ok);
+  return mlir::success();
+}
+
 struct QuillCanonicalizePipelinePass
     : public mlir::PassWrapper<QuillCanonicalizePipelinePass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -442,9 +788,15 @@ struct ConvertQuillToLoopsPass
       func.walk([&](mlir::quill::PlainSumSinkOp) { hasPlainSum = true; });
       bool hasRecordSink = false;
       func.walk([&](mlir::quill::RecordBatchSinkOp) { hasRecordSink = true; });
+      bool hasGroupUpdate = false;
+      func.walk([&](mlir::quill::GroupUpdateSinkOp) {
+        hasGroupUpdate = true;
+      });
 
       mlir::LogicalResult result = mlir::success();
-      if (hasPlainSum)
+      if (hasGroupUpdate)
+        result = lowerGroupAggregateUpdate(func);
+      else if (hasPlainSum)
         result = lowerFilterPlainSum(func);
       else if (hasRecordSink)
         result = lowerFilterProject(func);

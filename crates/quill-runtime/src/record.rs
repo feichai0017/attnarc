@@ -7,14 +7,12 @@ use quill_plan::{JitError, JitExpr, JitProjection, JitResult, JitType};
 
 use super::array::{arrow_type, BatchView, OutputBuilder};
 use super::eval::{ensure_supported_expr, eval_expr};
-use super::PipelineSpec;
 
 #[derive(Debug, Clone)]
 pub struct FilterProjectKernel {
     predicate: JitExpr,
     projections: Vec<JitProjection>,
     schema: ArrowSchemaRef,
-    spec: Option<PipelineSpec>,
 }
 
 impl FilterProjectKernel {
@@ -50,12 +48,10 @@ impl FilterProjectKernel {
             }
         }
 
-        let spec = PipelineSpec::record_project(&predicate, &projections);
         Ok(Self {
             predicate,
             projections,
             schema,
-            spec,
         })
     }
 
@@ -65,10 +61,6 @@ impl FilterProjectKernel {
 
     pub fn projections(&self) -> &[JitProjection] {
         &self.projections
-    }
-
-    pub fn spec(&self) -> Option<&PipelineSpec> {
-        self.spec.as_ref()
     }
 
     pub fn schema(&self) -> ArrowSchemaRef {

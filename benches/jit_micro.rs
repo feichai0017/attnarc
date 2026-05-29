@@ -8,9 +8,10 @@ use quill_core::database::{Database, DatabaseOptions};
 use quill_jit::{FixedColumnInput, RecordPipelineOutput};
 use quill_jit::{JitOptions, MlirBackend, PipelineLowering};
 use quill_plan::{
-    JitBinaryOp, JitExpr, JitProjection, JitScalar, JitType, PipelineGraph, PipelineStage,
+    AggregateFunc, GroupAggregate, JitBinaryOp, JitExpr, JitProjection, JitScalar, JitType,
+    PipelineGraph, PipelineStage,
 };
-use quill_runtime::KernelBackend;
+use quill_runtime::GroupAggregateStateField;
 
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -199,7 +200,6 @@ fn decimal_lit(value: i128, precision: u8, scale: i8) -> JitExpr {
 }
 
 fn bench_pipeline_graph_and_mlir(c: &mut Criterion) {
-    let input_schema = schema();
     let predicate = predicate();
     let projections = projections();
     let backend = MlirBackend::new();
@@ -214,38 +214,20 @@ fn bench_pipeline_graph_and_mlir(c: &mut Criterion) {
         });
     });
 
-    c.bench_function("compile/mlir_filter_text", |b| {
+    c.bench_function("lowering/mlir_record_dialect", |b| {
         b.iter(|| {
+            let pipeline = PipelineGraph::record(vec![
+                PipelineStage::Filter(black_box(predicate.clone())),
+                PipelineStage::Projection(black_box(projections.clone())),
+            ]);
             black_box(
                 backend
-                    .compile_filter(black_box(Arc::clone(&input_schema)), black_box(&predicate))
-                    .expect("compile filter"),
+                    .lower_graph_to_quill_mlir("bench_record_pipeline", &pipeline)
+                    .expect("lower graph to dialect"),
             )
         });
     });
 
-    c.bench_function("compile/mlir_filter_project_text", |b| {
-        b.iter(|| {
-            black_box(
-                backend
-                    .compile_filter_project(
-                        black_box(Arc::clone(&input_schema)),
-                        black_box(&predicate),
-                        black_box(&projections),
-                    )
-                    .expect("compile filter project"),
-            )
-        });
-    });
-    c.bench_function("compile/mlir_i64_filter", |b| {
-        b.iter(|| {
-            black_box(
-                backend
-                    .compile_i64_filter(black_box(&predicate))
-                    .expect("compile i64 filter"),
-            )
-        });
-    });
     c.bench_function("compile/mlir_record_pipeline", |b| {
         b.iter(|| {
             black_box(
@@ -274,6 +256,20 @@ fn bench_pipeline_graph_and_mlir(c: &mut Criterion) {
                 backend
                     .compile_plain_sum(black_box(&predicate), black_box(&measure))
                     .expect("compile decimal plain sum"),
+            )
+        });
+    });
+    c.bench_function("compile/mlir_group_aggregate_dense_update", |b| {
+        let key = group_key();
+        let aggregates = group_aggregates();
+        b.iter(|| {
+            black_box(
+                backend
+                    .compile_group_aggregate_update(
+                        black_box(std::slice::from_ref(&key)),
+                        black_box(&aggregates),
+                    )
+                    .expect("compile group aggregate update"),
             )
         });
     });
@@ -361,26 +357,6 @@ fn bench_datafusion_filter_sum(c: &mut Criterion) {
     });
     c.bench_function("sql/df/prepared_filter_sum_64k", |b| {
         b.iter(|| black_box(runtime.block_on(prepared.run()).expect("query")));
-    });
-}
-
-fn bench_compiled_i64_filter_kernel(c: &mut Criterion) {
-    let row_count = 65_536_i64;
-    let values = (0..row_count)
-        .map(|value| value % 1_000)
-        .collect::<Vec<_>>();
-    let mut output = vec![0_u8; values.len()];
-    let kernel = MlirBackend::new()
-        .compile_i64_filter(&predicate())
-        .expect("compiled i64 filter");
-
-    c.bench_function("kernel/i64_filter_64k", |b| {
-        b.iter(|| {
-            kernel
-                .invoke(black_box(&values), black_box(&mut output))
-                .expect("execute compiled filter");
-            black_box(&output);
-        });
     });
 }
 
@@ -508,13 +484,122 @@ fn bench_compiled_decimal_plain_sum_kernel(c: &mut Criterion) {
     });
 }
 
+fn bench_compiled_group_aggregate_dense_update_kernel(c: &mut Criterion) {
+    let row_count = 65_536_i64;
+    let group_count = 1_024_usize;
+    let group_ids = (0..row_count)
+        .map(|value| value % group_count as i64)
+        .collect::<Vec<_>>();
+    let values = (0..row_count)
+        .map(|value| value % 1_000)
+        .collect::<Vec<_>>();
+    let key = group_key();
+    let aggregates = group_aggregates();
+    let kernel = MlirBackend::new()
+        .compile_group_aggregate_update(&[key], &aggregates)
+        .expect("compiled group aggregate update");
+    let mut state_fields = vec![
+        int64_state(group_count),
+        int64_state(group_count),
+        uint64_state(group_count),
+        int64_state(group_count),
+    ];
+
+    c.bench_function("kernel/group_aggregate_dense_update_64k", |b| {
+        b.iter(|| {
+            reset_states(&mut state_fields);
+            kernel
+                .invoke(
+                    black_box(group_ids.as_slice()),
+                    black_box(&[FixedColumnInput::Int64 {
+                        index: 1,
+                        values: values.as_slice(),
+                    }]),
+                    black_box(&mut state_fields),
+                )
+                .expect("execute compiled group aggregate update");
+            black_box(&state_fields);
+        });
+    });
+}
+
+fn group_key() -> JitExpr {
+    JitExpr::Column {
+        index: 0,
+        name: "k".to_string(),
+        ty: JitType::Int64,
+        nullable: false,
+    }
+}
+
+fn group_aggregates() -> Vec<GroupAggregate> {
+    let value = JitExpr::Column {
+        index: 1,
+        name: "v".to_string(),
+        ty: JitType::Int64,
+        nullable: false,
+    };
+    vec![
+        GroupAggregate::new(AggregateFunc::Sum, value.clone(), JitType::Int64, "sum_v"),
+        GroupAggregate::new(
+            AggregateFunc::Count,
+            JitExpr::Literal(JitScalar::Int64(1)),
+            JitType::Int64,
+            "count_star",
+        ),
+        GroupAggregate::new_with_states(
+            AggregateFunc::Avg,
+            value,
+            vec![JitType::UInt64, JitType::Int64],
+            "avg_v",
+        ),
+    ]
+}
+
+fn int64_state(len: usize) -> GroupAggregateStateField {
+    GroupAggregateStateField::Int64 {
+        values: vec![0; len],
+        valid: vec![0; len],
+    }
+}
+
+fn uint64_state(len: usize) -> GroupAggregateStateField {
+    GroupAggregateStateField::UInt64 {
+        values: vec![0; len],
+        valid: vec![0; len],
+    }
+}
+
+fn reset_states(fields: &mut [GroupAggregateStateField]) {
+    for field in fields {
+        match field {
+            GroupAggregateStateField::Int64 { values, valid } => {
+                values.fill(0);
+                valid.fill(0);
+            }
+            GroupAggregateStateField::UInt64 { values, valid } => {
+                values.fill(0);
+                valid.fill(0);
+            }
+            GroupAggregateStateField::Float64 { values, valid } => {
+                values.fill(0.0);
+                valid.fill(0);
+            }
+            GroupAggregateStateField::Decimal128 { values, valid, .. } => {
+                values.fill(0);
+                valid.fill(0);
+            }
+        }
+    }
+}
+
 criterion_group!(
     benches,
     bench_pipeline_graph_and_mlir,
-    bench_compiled_i64_filter_kernel,
     bench_compiled_record_pipeline_kernel,
     bench_compiled_f64_plain_sum_kernel,
     bench_compiled_decimal_plain_sum_kernel,
+    bench_compiled_group_aggregate_dense_update_kernel,
     bench_datafusion_filter_project,
     bench_datafusion_filter_sum
 );

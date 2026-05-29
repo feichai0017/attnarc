@@ -9,4 +9,3 @@ repository = "https://github.com/feichai0017/quillsql"
 [dependencies]
 arrow = { workspace = true }
 quill-plan = { version = "0.3.1", path = "../quill-plan" }
-serde = { workspace = true }

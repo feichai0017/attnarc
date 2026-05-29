@@ -3,6 +3,7 @@ mod frontend;
 mod fusion;
 mod mlir;
 mod options;
+mod spec;
 
 pub use dialect::{QuillDialectModule, QuillDialectOp, QuillDialectSink, QuillDialectSource};
 pub use frontend::{CompiledPipeline, FrontendAdapter};
@@ -11,8 +12,8 @@ pub use fusion::{
     PipelineLowering,
 };
 pub use mlir::{
-    CompiledI64Filter, CompiledPlainSum, CompiledRecordPipeline, FixedColumnInput, MlirBackend,
-    MlirColumn, MlirModule, RecordPipelineOutput,
+    CompiledGroupAggregateUpdate, CompiledPlainSum, CompiledRecordPipeline, FixedColumnInput,
+    MlirBackend, MlirColumn, MlirModule, RecordPipelineOutput,
 };
 pub use options::JitOptions;
 pub use quill_plan::{
@@ -20,9 +21,7 @@ pub use quill_plan::{
     JitScalar, JitType, OperatorKind, OperatorProperties, OutputMode, PipelineGraph, PipelineKind,
     PipelineSink, PipelineSource, PipelineStage,
 };
-pub use quill_runtime::{
-    CompiledKernel, FilterProjectKernel, FilterSumKernel, FilterSumValue, FixedColumn,
-    KernelBackend, KernelKind, PipelineSpec,
-};
+pub use quill_runtime::{FilterProjectKernel, FilterSumKernel, FilterSumValue};
+pub use spec::{CompiledKernel, FixedColumn, KernelKind, PipelineSpec};
 
-pub use mlir::{execute_filter_project, execute_filter_sum};
+pub use mlir::{execute_filter_project, execute_filter_sum, execute_group_aggregate_update};

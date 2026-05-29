@@ -33,6 +33,19 @@ impl<'a> BatchView<'a> {
             .ok_or_else(|| JitError::Backend(format!("column index {index} out of bounds")))?;
         column.value(row)
     }
+
+    pub(super) fn utf8_value(&self, index: usize, row: usize) -> JitResult<Option<&'a str>> {
+        let column = self
+            .columns
+            .get(index)
+            .ok_or_else(|| JitError::Backend(format!("column index {index} out of bounds")))?;
+        match column {
+            ColumnView::Utf8(array) => Ok(array.is_valid(row).then(|| array.value(row))),
+            _ => Err(JitError::UnsupportedType(format!(
+                "column {index} is not Utf8"
+            ))),
+        }
+    }
 }
 
 enum ColumnView<'a> {

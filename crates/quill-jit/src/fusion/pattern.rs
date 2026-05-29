@@ -1,4 +1,6 @@
-use quill_plan::{OperatorKind, PipelineGraph, PipelineSource};
+use quill_plan::{OperatorKind, PipelineGraph, PipelineSink, PipelineSource, PipelineStage};
+
+use crate::PipelineSpec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FusionConstraint {
@@ -22,7 +24,7 @@ impl FusionConstraint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FusionLoweringKind {
     Record,
-    PlainSum,
+    PlainAggregate,
     GroupAggregate,
 }
 
@@ -30,7 +32,7 @@ impl FusionLoweringKind {
     pub fn name(self) -> &'static str {
         match self {
             Self::Record => "record_filter_project",
-            Self::PlainSum => "plain_sum_loop",
+            Self::PlainAggregate => "plain_aggregate_loop",
             Self::GroupAggregate => "group_aggregate_loop",
         }
     }
@@ -56,5 +58,43 @@ impl FusionPattern {
                 .iter()
                 .zip(self.stages.iter())
                 .all(|(stage, expected)| stage.operator_kind() == *expected)
+    }
+
+    pub(crate) fn satisfies_constraints(self, graph: &PipelineGraph) -> bool {
+        self.constraints
+            .iter()
+            .copied()
+            .all(|constraint| constraint.is_satisfied_by(graph))
+    }
+}
+
+impl FusionConstraint {
+    fn is_satisfied_by(self, graph: &PipelineGraph) -> bool {
+        match self {
+            Self::ArrowBatchSource => graph.source == PipelineSource::ArrowBatch,
+            Self::FixedWidthRecordBatch => match (&graph.stages[..], &graph.sink) {
+                (
+                    [PipelineStage::Filter(predicate), PipelineStage::Projection(projections)],
+                    PipelineSink::RecordBatch,
+                ) => PipelineSpec::record_project(predicate, projections).is_some(),
+                _ => false,
+            },
+            Self::FixedWidthPlainAggregate => match (&graph.stages[..], &graph.sink) {
+                ([PipelineStage::Filter(predicate)], PipelineSink::Sum { measure }) => {
+                    PipelineSpec::filter_sum(predicate, measure).is_some()
+                }
+                _ => false,
+            },
+            Self::FixedWidthGroupAggregate => match (&graph.stages[..], &graph.sink) {
+                ([], PipelineSink::GroupAggregate { keys, aggregates }) => {
+                    PipelineSpec::group_aggregate(None, keys, aggregates).is_some()
+                }
+                (
+                    [PipelineStage::Filter(predicate)],
+                    PipelineSink::GroupAggregate { keys, aggregates },
+                ) => PipelineSpec::group_aggregate(Some(predicate), keys, aggregates).is_some(),
+                _ => false,
+            },
+        }
     }
 }

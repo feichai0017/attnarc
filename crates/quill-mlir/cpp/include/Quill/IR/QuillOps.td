@@ -26,6 +26,7 @@ class Quill_Type<string name, string typeMnemonic> : TypeDef<Quill_Dialect, name
 
 def Quill_BatchType : Quill_Type<"Batch", "batch">;
 def Quill_SelectionType : Quill_Type<"Selection", "selection">;
+def Quill_GroupIdsType : Quill_Type<"GroupIds", "group_ids">;
 def Quill_RowType : Quill_Type<"Row", "row">;
 def Quill_ScalarType : Quill_Type<"Scalar", "scalar">;
 
@@ -35,12 +36,45 @@ def Quill_Batch :
 def Quill_Selection :
     Type<CPred<"::llvm::isa<::mlir::quill::SelectionType>($_self)">,
          "Quill selection">;
+def Quill_GroupIds :
+    Type<CPred<"::llvm::isa<::mlir::quill::GroupIdsType>($_self)">,
+         "Quill group ids">;
 def Quill_Row :
     Type<CPred<"::llvm::isa<::mlir::quill::RowType>($_self)">,
          "Quill row">;
 def Quill_Scalar :
     Type<CPred<"::llvm::isa<::mlir::quill::ScalarType>($_self)">,
          "Quill scalar">;
+
+def Quill_AggregateFuncArrayAttr
+    : TypedArrayAttrBase<StrAttr, "Quill aggregate function array"> {
+  let predicate = And<[
+    TypedArrayAttrBase<StrAttr, "Quill aggregate function array">.predicate,
+    CPred<[{
+      ::llvm::all_of(::llvm::cast<::mlir::ArrayAttr>($_self),
+                     [](::mlir::Attribute attr) {
+        auto value = ::llvm::cast<::mlir::StringAttr>(attr).getValue();
+        return value == "sum" || value == "count" || value == "avg" ||
+               value == "min" || value == "max";
+      })
+    }]>
+  ]>;
+}
+
+def Quill_AggregateStateTypeArrayAttr
+    : TypedArrayAttrBase<StrAttr, "Quill aggregate state type array"> {
+  let predicate = And<[
+    TypedArrayAttrBase<StrAttr, "Quill aggregate state type array">.predicate,
+    CPred<[{
+      ::llvm::all_of(::llvm::cast<::mlir::ArrayAttr>($_self),
+                     [](::mlir::Attribute attr) {
+        auto value = ::llvm::cast<::mlir::StringAttr>(attr).getValue();
+        return value == "i64" || value == "u64" || value == "f64" ||
+               value == "i128";
+      })
+    }]>
+  ]>;
+}
 
 class Quill_Op<string mnemonic, list<Trait> traits = []>
     : Op<Quill_Dialect, mnemonic, traits>;
@@ -90,6 +124,19 @@ def Quill_LimitOp
   let assemblyFormat = "$selection attr-dict `:` type($selection) `->` type($result)";
 }
 
+def Quill_GroupIdsOp
+    : Quill_Op<"exec.group_ids", [SingleBlock]> {
+  let summary = "bind selected rows to dense runtime group ids";
+  let arguments = (ins Quill_Batch:$batch, Quill_Selection:$selection);
+  let regions = (region SizedRegion<1>:$keys);
+  let results = (outs Quill_GroupIds:$group_ids);
+  let hasVerifier = 1;
+  let assemblyFormat = [{
+    $batch `,` $selection $keys attr-dict `:`
+    type($batch) `,` type($selection) `->` type($group_ids)
+  }];
+}
+
 def Quill_RecordBatchSinkOp
     : Quill_Op<"sink.record_batch", []> {
   let summary = "materialize a batch result";
@@ -111,17 +158,19 @@ def Quill_PlainSumSinkOp
   }];
 }
 
-def Quill_GroupAggregateSinkOp
-    : Quill_Op<"sink.group_aggregate", [SingleBlock]> {
+def Quill_GroupUpdateSinkOp
+    : Quill_Op<"sink.group_update", [SingleBlock]> {
   let summary = "consume selected rows into grouped aggregate state";
   let arguments = (ins Quill_Batch:$batch, Quill_Selection:$selection,
-                   I64Attr:$key_count);
+                   Quill_GroupIds:$group_ids,
+                   Quill_AggregateFuncArrayAttr:$aggregate_funcs,
+                   Quill_AggregateStateTypeArrayAttr:$state_types);
   let regions = (region SizedRegion<1>:$state);
   let results = (outs Quill_Batch:$result);
   let hasVerifier = 1;
   let assemblyFormat = [{
-    $batch `,` $selection $state attr-dict `:`
-    type($batch) `,` type($selection) `->` type($result)
+    $batch `,` $selection `,` $group_ids $state attr-dict `:`
+    type($batch) `,` type($selection) `,` type($group_ids) `->` type($result)
   }];
 }
 

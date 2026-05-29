@@ -3142,7 +3142,6 @@ version = "0.3.1"
 dependencies = [
  "arrow 58.3.0",
  "quill-plan",
- "serde",
 ]
 
 [[package]]

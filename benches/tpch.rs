@@ -78,7 +78,7 @@ const TPCH_QUERIES: &[TpchQuery] = &[
         name: "q1_grouped_aggregate_sort",
         sql: Q1,
         tables: &["lineitem"],
-        compare_jit_modes: false,
+        compare_jit_modes: true,
     },
     TpchQuery {
         name: "q3_join_aggregate",
