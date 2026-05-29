@@ -6,7 +6,8 @@ use arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use arrow::record_batch::RecordBatch;
 
 use quill_plan::{
-    AggregateFunc, GroupAggregate, JitError, JitExpr, JitResult, JitType, PipelineStage,
+    AggregateFunc, GroupAggregate, JitBinaryOp, JitError, JitExpr, JitResult, JitScalar, JitType,
+    PipelineStage,
 };
 
 use super::array::{BatchView, OutputBuilder};
@@ -16,15 +17,17 @@ use super::value::Scalar;
 #[derive(Debug, Clone)]
 pub struct GroupAggregateKernel {
     predicate: Option<JitExpr>,
+    predicate_plan: PredicatePlan,
     keys: Vec<JitExpr>,
     aggregates: Vec<GroupAggregate>,
     schema: ArrowSchemaRef,
+    fast_key_plan: FastKeyPlan,
 }
 
 #[derive(Debug, Clone)]
 pub struct GroupAggregateState {
     group_ids: BTreeMap<GroupKey, usize>,
-    fast_group_ids: HashMap<Vec<FastKeyValue>, usize>,
+    fast_group_ids: FastGroupMap,
     string_key_ids: Vec<StringKeyDictionary>,
     groups: Vec<GroupState>,
     dense: Option<GroupAggregateDenseState>,
@@ -104,9 +107,89 @@ enum FastKeyValue {
 }
 
 #[derive(Debug, Clone)]
+enum PredicatePlan {
+    None,
+    Compiled(PredicateNode),
+    Interpret(JitExpr),
+}
+
+#[derive(Debug, Clone)]
+enum PredicateNode {
+    Literal(bool),
+    Column(PredicateColumn),
+    Compare {
+        op: JitBinaryOp,
+        column: PredicateColumn,
+        literal: PredicateLiteral,
+    },
+    And(Box<PredicateNode>, Box<PredicateNode>),
+    Or(Box<PredicateNode>, Box<PredicateNode>),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PredicateColumn {
+    Bool { index: usize },
+    Date32 { index: usize },
+    Int32 { index: usize },
+    Int64 { index: usize },
+    UInt64 { index: usize },
+    Decimal128 { index: usize, scale: i8 },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PredicateLiteral {
+    Bool(bool),
+    Date32(i32),
+    Int32(i32),
+    Int64(i64),
+    UInt64(u64),
+    Decimal128 { value: i128, scale: i8 },
+}
+
+#[derive(Debug, Clone)]
+enum FastKeyPlan {
+    Columns(Vec<FastKeyColumn>),
+    Unsupported,
+}
+
+#[derive(Debug, Clone)]
+enum FastKeyColumn {
+    Bool {
+        index: usize,
+    },
+    Date32 {
+        index: usize,
+    },
+    Int32 {
+        index: usize,
+    },
+    Int64 {
+        index: usize,
+    },
+    UInt64 {
+        index: usize,
+    },
+    Utf8 {
+        index: usize,
+        key_index: usize,
+    },
+    Decimal128 {
+        index: usize,
+        precision: u8,
+        scale: i8,
+    },
+}
+
+#[derive(Debug, Clone)]
 struct StringKeyDictionary {
     entries: Vec<(Arc<str>, u32)>,
     map: Option<HashMap<Arc<str>, u32>>,
+}
+
+#[derive(Debug, Clone)]
+struct FastGroupMap {
+    entries: Vec<(Vec<FastKeyValue>, usize)>,
+    map: Option<HashMap<Vec<FastKeyValue>, usize>>,
 }
 
 #[derive(Debug, Clone)]
@@ -168,7 +251,9 @@ impl GroupAggregateKernel {
         }
 
         Ok(Self {
+            predicate_plan: PredicatePlan::from_predicate(predicate.as_ref()),
             predicate,
+            fast_key_plan: FastKeyPlan::from_keys(&keys),
             keys,
             aggregates,
             schema,
@@ -198,7 +283,7 @@ impl GroupAggregateKernel {
     pub fn new_state(&self) -> GroupAggregateState {
         GroupAggregateState {
             group_ids: BTreeMap::new(),
-            fast_group_ids: HashMap::new(),
+            fast_group_ids: FastGroupMap::new(),
             string_key_ids: vec![StringKeyDictionary::new(); self.keys.len()],
             groups: Vec::new(),
             dense: None,
@@ -211,19 +296,54 @@ impl GroupAggregateKernel {
         batch: &RecordBatch,
     ) -> JitResult<GroupAggregateBatchBinding> {
         let view = BatchView::try_new(batch)?;
-        let mut group_ids = Vec::with_capacity(batch.num_rows());
+        match &self.predicate_plan {
+            PredicatePlan::None => self.bind_batch_without_filter(state, &view, batch.num_rows()),
+            predicate => self.bind_batch_with_filter(predicate, state, &view, batch.num_rows()),
+        }
+    }
+
+    #[inline(always)]
+    fn bind_batch_without_filter(
+        &self,
+        state: &mut GroupAggregateState,
+        view: &BatchView<'_>,
+        row_count: usize,
+    ) -> JitResult<GroupAggregateBatchBinding> {
+        let mut group_ids = Vec::with_capacity(row_count);
+        let mut fast_key = Vec::with_capacity(self.keys.len());
+
+        for row in 0..row_count {
+            let group_id = self.group_id_for_row(state, view, row, &mut fast_key)?;
+            let group_id = i64::try_from(group_id)
+                .map_err(|_| JitError::Backend("group id does not fit in i64".to_string()))?;
+            group_ids.push(group_id);
+        }
+
+        Ok(GroupAggregateBatchBinding {
+            group_ids,
+            selected_rows: row_count,
+        })
+    }
+
+    #[inline(never)]
+    fn bind_batch_with_filter(
+        &self,
+        predicate: &PredicatePlan,
+        state: &mut GroupAggregateState,
+        view: &BatchView<'_>,
+        row_count: usize,
+    ) -> JitResult<GroupAggregateBatchBinding> {
+        let mut group_ids = Vec::with_capacity(row_count);
         let mut selected_rows = 0_usize;
         let mut fast_key = Vec::with_capacity(self.keys.len());
 
-        for row in 0..batch.num_rows() {
-            if let Some(predicate) = &self.predicate {
-                if !eval_expr(predicate, &view, row)?.is_filter_true()? {
-                    group_ids.push(-1);
-                    continue;
-                }
+        for row in 0..row_count {
+            if !predicate.selects(view, row)? {
+                group_ids.push(-1);
+                continue;
             }
 
-            let group_id = self.group_id_for_row(state, &view, row, &mut fast_key)?;
+            let group_id = self.group_id_for_row(state, view, row, &mut fast_key)?;
             let group_id = i64::try_from(group_id)
                 .map_err(|_| JitError::Backend("group id does not fit in i64".to_string()))?;
             group_ids.push(group_id);
@@ -399,47 +519,17 @@ impl GroupAggregateKernel {
         row: usize,
         fast_key: &mut Vec<FastKeyValue>,
     ) -> JitResult<usize> {
-        if self.fast_key_for_row(state, view, row, fast_key)? {
+        if self.fast_key_plan.bind_row(state, view, row, fast_key)? {
             if let Some(group_id) = state.fast_group_ids.get(fast_key.as_slice()) {
-                return Ok(*group_id);
+                return Ok(group_id);
             }
 
             let key = self.eval_key(view, row)?;
-            return Ok(state.group_id_with_fast_key(key, fast_key.clone(), &self.aggregates));
+            return Ok(state.insert_group_with_fast_key(key, fast_key.clone(), &self.aggregates));
         }
 
         let key = self.eval_key(view, row)?;
         Ok(state.group_id(key, &self.aggregates))
-    }
-
-    fn fast_key_for_row(
-        &self,
-        state: &mut GroupAggregateState,
-        view: &BatchView<'_>,
-        row: usize,
-        key: &mut Vec<FastKeyValue>,
-    ) -> JitResult<bool> {
-        key.clear();
-        for (key_index, expr) in self.keys.iter().enumerate() {
-            match expr {
-                JitExpr::Column {
-                    index,
-                    ty: JitType::Utf8,
-                    ..
-                } => {
-                    let value = view
-                        .utf8_value(*index, row)?
-                        .map(|value| state.intern_string_key(key_index, value))
-                        .transpose()?;
-                    key.push(FastKeyValue::Utf8(value));
-                }
-                JitExpr::Column { index, ty, .. } => {
-                    key.push(fixed_fast_key_value(view, *index, *ty, row)?);
-                }
-                _ => return Ok(false),
-            }
-        }
-        Ok(true)
     }
 }
 
@@ -462,16 +552,12 @@ impl GroupAggregateState {
         self.insert_group(key, aggregates)
     }
 
-    fn group_id_with_fast_key(
+    fn insert_group_with_fast_key(
         &mut self,
         key: GroupKey,
         fast_key: Vec<FastKeyValue>,
         aggregates: &[GroupAggregate],
     ) -> usize {
-        if let Some(group_id) = self.fast_group_ids.get(fast_key.as_slice()) {
-            return *group_id;
-        }
-
         let group_id = self.insert_group(key, aggregates);
         self.fast_group_ids.insert(fast_key, group_id);
         group_id
@@ -588,30 +674,358 @@ impl GroupAggregateState {
     }
 }
 
-fn fixed_fast_key_value(
-    view: &BatchView<'_>,
-    index: usize,
-    ty: JitType,
-    row: usize,
-) -> JitResult<FastKeyValue> {
-    match ty {
-        JitType::Bool => Ok(FastKeyValue::Bool(view.bool_value(index, row)?)),
-        JitType::Date32 => Ok(FastKeyValue::Date32(view.date32_value(index, row)?)),
-        JitType::Int32 => Ok(FastKeyValue::Int32(view.int32_value(index, row)?)),
-        JitType::Int64 => Ok(FastKeyValue::Int64(view.int64_value(index, row)?)),
-        JitType::UInt64 => Ok(FastKeyValue::UInt64(view.uint64_value(index, row)?)),
-        JitType::Decimal128 { precision, scale } => Ok(FastKeyValue::Decimal128 {
-            value: view.decimal128_value(index, row)?,
-            precision,
-            scale,
-        }),
-        JitType::Float64 | JitType::Utf8 => Err(JitError::UnsupportedType(format!(
-            "fast group key does not support {ty:?}"
-        ))),
+const INLINE_STRING_KEY_LIMIT: usize = 16;
+const INLINE_FAST_GROUP_LIMIT: usize = 32;
+
+impl PredicatePlan {
+    fn from_predicate(predicate: Option<&JitExpr>) -> Self {
+        let Some(predicate) = predicate else {
+            return Self::None;
+        };
+        PredicateNode::from_expr(predicate)
+            .map(Self::Compiled)
+            .unwrap_or_else(|| Self::Interpret(predicate.clone()))
+    }
+
+    fn selects(&self, view: &BatchView<'_>, row: usize) -> JitResult<bool> {
+        match self {
+            Self::None => Ok(true),
+            Self::Compiled(predicate) => predicate.selects(view, row),
+            Self::Interpret(predicate) => eval_expr(predicate, view, row)?.is_filter_true(),
+        }
     }
 }
 
-const INLINE_STRING_KEY_LIMIT: usize = 16;
+impl PredicateNode {
+    fn from_expr(expr: &JitExpr) -> Option<Self> {
+        match expr {
+            JitExpr::Literal(JitScalar::Bool(value)) => Some(Self::Literal(*value)),
+            JitExpr::Column {
+                index,
+                ty: JitType::Bool,
+                ..
+            } => Some(Self::Column(PredicateColumn::Bool { index: *index })),
+            JitExpr::Binary {
+                op: JitBinaryOp::And,
+                left,
+                right,
+                ..
+            } => Some(Self::And(
+                Box::new(Self::from_expr(left)?),
+                Box::new(Self::from_expr(right)?),
+            )),
+            JitExpr::Binary {
+                op: JitBinaryOp::Or,
+                left,
+                right,
+                ..
+            } => Some(Self::Or(
+                Box::new(Self::from_expr(left)?),
+                Box::new(Self::from_expr(right)?),
+            )),
+            JitExpr::Binary {
+                op, left, right, ..
+            } if is_comparison_op(*op) => Self::from_comparison(*op, left, right),
+            _ => None,
+        }
+    }
+
+    fn from_comparison(op: JitBinaryOp, left: &JitExpr, right: &JitExpr) -> Option<Self> {
+        if let (Some(column), Some(literal)) = (
+            PredicateColumn::from_expr(left),
+            PredicateLiteral::from_expr(right),
+        ) {
+            if column.matches_literal(literal) && column.supports_op(op) {
+                return Some(Self::Compare {
+                    op,
+                    column,
+                    literal,
+                });
+            }
+        }
+
+        if let (Some(literal), Some(column)) = (
+            PredicateLiteral::from_expr(left),
+            PredicateColumn::from_expr(right),
+        ) {
+            let op = reverse_comparison_op(op)?;
+            if column.matches_literal(literal) && column.supports_op(op) {
+                return Some(Self::Compare {
+                    op,
+                    column,
+                    literal,
+                });
+            }
+        }
+
+        None
+    }
+
+    fn selects(&self, view: &BatchView<'_>, row: usize) -> JitResult<bool> {
+        match self {
+            Self::Literal(value) => Ok(*value),
+            Self::Column(column) => column.bool_value(view, row),
+            Self::Compare {
+                op,
+                column,
+                literal,
+            } => column.compare(*op, *literal, view, row),
+            Self::And(left, right) => {
+                if !left.selects(view, row)? {
+                    return Ok(false);
+                }
+                right.selects(view, row)
+            }
+            Self::Or(left, right) => {
+                if left.selects(view, row)? {
+                    return Ok(true);
+                }
+                right.selects(view, row)
+            }
+        }
+    }
+}
+
+impl PredicateColumn {
+    fn from_expr(expr: &JitExpr) -> Option<Self> {
+        let JitExpr::Column { index, ty, .. } = expr else {
+            return None;
+        };
+        match ty {
+            JitType::Bool => Some(Self::Bool { index: *index }),
+            JitType::Date32 => Some(Self::Date32 { index: *index }),
+            JitType::Int32 => Some(Self::Int32 { index: *index }),
+            JitType::Int64 => Some(Self::Int64 { index: *index }),
+            JitType::UInt64 => Some(Self::UInt64 { index: *index }),
+            JitType::Decimal128 { scale, .. } => Some(Self::Decimal128 {
+                index: *index,
+                scale: *scale,
+            }),
+            JitType::Float64 | JitType::Utf8 => None,
+        }
+    }
+
+    fn matches_literal(self, literal: PredicateLiteral) -> bool {
+        match (self, literal) {
+            (Self::Bool { .. }, PredicateLiteral::Bool(_))
+            | (Self::Date32 { .. }, PredicateLiteral::Date32(_))
+            | (Self::Int32 { .. }, PredicateLiteral::Int32(_))
+            | (Self::Int64 { .. }, PredicateLiteral::Int64(_))
+            | (Self::UInt64 { .. }, PredicateLiteral::UInt64(_)) => true,
+            (
+                Self::Decimal128 { scale: left, .. },
+                PredicateLiteral::Decimal128 { scale: right, .. },
+            ) => left == right,
+            _ => false,
+        }
+    }
+
+    fn supports_op(self, op: JitBinaryOp) -> bool {
+        match self {
+            Self::Bool { .. } => matches!(op, JitBinaryOp::Eq | JitBinaryOp::NotEq),
+            Self::Date32 { .. }
+            | Self::Int32 { .. }
+            | Self::Int64 { .. }
+            | Self::UInt64 { .. }
+            | Self::Decimal128 { .. } => is_comparison_op(op),
+        }
+    }
+
+    fn bool_value(self, view: &BatchView<'_>, row: usize) -> JitResult<bool> {
+        let Self::Bool { index } = self else {
+            return Err(JitError::Backend(
+                "compiled predicate expected Boolean column".to_string(),
+            ));
+        };
+        Ok(view.bool_value(index, row)?.unwrap_or(false))
+    }
+
+    fn compare(
+        self,
+        op: JitBinaryOp,
+        literal: PredicateLiteral,
+        view: &BatchView<'_>,
+        row: usize,
+    ) -> JitResult<bool> {
+        match (self, literal) {
+            (Self::Bool { index }, PredicateLiteral::Bool(literal)) => Ok(view
+                .bool_value(index, row)?
+                .is_some_and(|value| compare_bool_value(op, value, literal))),
+            (Self::Date32 { index }, PredicateLiteral::Date32(literal)) => Ok(view
+                .date32_value(index, row)?
+                .is_some_and(|value| compare_ordered(op, value, literal))),
+            (Self::Int32 { index }, PredicateLiteral::Int32(literal)) => Ok(view
+                .int32_value(index, row)?
+                .is_some_and(|value| compare_ordered(op, value, literal))),
+            (Self::Int64 { index }, PredicateLiteral::Int64(literal)) => Ok(view
+                .int64_value(index, row)?
+                .is_some_and(|value| compare_ordered(op, value, literal))),
+            (Self::UInt64 { index }, PredicateLiteral::UInt64(literal)) => Ok(view
+                .uint64_value(index, row)?
+                .is_some_and(|value| compare_ordered(op, value, literal))),
+            (
+                Self::Decimal128 { index, scale },
+                PredicateLiteral::Decimal128 {
+                    value: literal,
+                    scale: literal_scale,
+                },
+            ) if scale == literal_scale => Ok(view
+                .decimal128_value(index, row)?
+                .is_some_and(|value| compare_ordered(op, value, literal))),
+            _ => Err(JitError::Backend(
+                "compiled predicate column/literal type mismatch".to_string(),
+            )),
+        }
+    }
+}
+
+impl PredicateLiteral {
+    fn from_expr(expr: &JitExpr) -> Option<Self> {
+        match expr {
+            JitExpr::Literal(JitScalar::Bool(value)) => Some(Self::Bool(*value)),
+            JitExpr::Literal(JitScalar::Date32(value)) => Some(Self::Date32(*value)),
+            JitExpr::Literal(JitScalar::Int32(value)) => Some(Self::Int32(*value)),
+            JitExpr::Literal(JitScalar::Int64(value)) => Some(Self::Int64(*value)),
+            JitExpr::Literal(JitScalar::UInt64(value)) => Some(Self::UInt64(*value)),
+            JitExpr::Literal(JitScalar::Decimal128 { value, scale, .. }) => {
+                Some(Self::Decimal128 {
+                    value: *value,
+                    scale: *scale,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+fn is_comparison_op(op: JitBinaryOp) -> bool {
+    matches!(
+        op,
+        JitBinaryOp::Eq
+            | JitBinaryOp::NotEq
+            | JitBinaryOp::Lt
+            | JitBinaryOp::LtEq
+            | JitBinaryOp::Gt
+            | JitBinaryOp::GtEq
+    )
+}
+
+fn reverse_comparison_op(op: JitBinaryOp) -> Option<JitBinaryOp> {
+    match op {
+        JitBinaryOp::Eq => Some(JitBinaryOp::Eq),
+        JitBinaryOp::NotEq => Some(JitBinaryOp::NotEq),
+        JitBinaryOp::Lt => Some(JitBinaryOp::Gt),
+        JitBinaryOp::LtEq => Some(JitBinaryOp::GtEq),
+        JitBinaryOp::Gt => Some(JitBinaryOp::Lt),
+        JitBinaryOp::GtEq => Some(JitBinaryOp::LtEq),
+        _ => None,
+    }
+}
+
+fn compare_bool_value(op: JitBinaryOp, left: bool, right: bool) -> bool {
+    match op {
+        JitBinaryOp::Eq => left == right,
+        JitBinaryOp::NotEq => left != right,
+        _ => false,
+    }
+}
+
+fn compare_ordered<T: PartialOrd + PartialEq>(op: JitBinaryOp, left: T, right: T) -> bool {
+    match op {
+        JitBinaryOp::Eq => left == right,
+        JitBinaryOp::NotEq => left != right,
+        JitBinaryOp::Lt => left < right,
+        JitBinaryOp::LtEq => left <= right,
+        JitBinaryOp::Gt => left > right,
+        JitBinaryOp::GtEq => left >= right,
+        _ => false,
+    }
+}
+
+impl FastKeyPlan {
+    fn from_keys(keys: &[JitExpr]) -> Self {
+        let columns = keys
+            .iter()
+            .enumerate()
+            .map(|(key_index, key)| FastKeyColumn::from_expr(key_index, key))
+            .collect::<Option<Vec<_>>>();
+        columns.map_or(Self::Unsupported, Self::Columns)
+    }
+
+    fn bind_row(
+        &self,
+        state: &mut GroupAggregateState,
+        view: &BatchView<'_>,
+        row: usize,
+        key: &mut Vec<FastKeyValue>,
+    ) -> JitResult<bool> {
+        let Self::Columns(columns) = self else {
+            return Ok(false);
+        };
+
+        key.clear();
+        for column in columns {
+            key.push(column.value(state, view, row)?);
+        }
+        Ok(true)
+    }
+}
+
+impl FastKeyColumn {
+    fn from_expr(key_index: usize, expr: &JitExpr) -> Option<Self> {
+        let JitExpr::Column { index, ty, .. } = expr else {
+            return None;
+        };
+        match ty {
+            JitType::Bool => Some(Self::Bool { index: *index }),
+            JitType::Date32 => Some(Self::Date32 { index: *index }),
+            JitType::Int32 => Some(Self::Int32 { index: *index }),
+            JitType::Int64 => Some(Self::Int64 { index: *index }),
+            JitType::UInt64 => Some(Self::UInt64 { index: *index }),
+            JitType::Utf8 => Some(Self::Utf8 {
+                index: *index,
+                key_index,
+            }),
+            JitType::Decimal128 { precision, scale } => Some(Self::Decimal128 {
+                index: *index,
+                precision: *precision,
+                scale: *scale,
+            }),
+            JitType::Float64 => None,
+        }
+    }
+
+    fn value(
+        &self,
+        state: &mut GroupAggregateState,
+        view: &BatchView<'_>,
+        row: usize,
+    ) -> JitResult<FastKeyValue> {
+        match self {
+            Self::Bool { index } => Ok(FastKeyValue::Bool(view.bool_value(*index, row)?)),
+            Self::Date32 { index } => Ok(FastKeyValue::Date32(view.date32_value(*index, row)?)),
+            Self::Int32 { index } => Ok(FastKeyValue::Int32(view.int32_value(*index, row)?)),
+            Self::Int64 { index } => Ok(FastKeyValue::Int64(view.int64_value(*index, row)?)),
+            Self::UInt64 { index } => Ok(FastKeyValue::UInt64(view.uint64_value(*index, row)?)),
+            Self::Utf8 { index, key_index } => {
+                let value = view
+                    .utf8_value(*index, row)?
+                    .map(|value| state.intern_string_key(*key_index, value))
+                    .transpose()?;
+                Ok(FastKeyValue::Utf8(value))
+            }
+            Self::Decimal128 {
+                index,
+                precision,
+                scale,
+            } => Ok(FastKeyValue::Decimal128 {
+                value: view.decimal128_value(*index, row)?,
+                precision: *precision,
+                scale: *scale,
+            }),
+        }
+    }
+}
 
 impl StringKeyDictionary {
     fn new() -> Self {
@@ -651,6 +1065,41 @@ impl StringKeyDictionary {
             .iter()
             .map(|(value, id)| (Arc::clone(value), *id))
             .collect::<HashMap<_, _>>();
+        self.map = Some(map);
+    }
+}
+
+impl FastGroupMap {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            map: None,
+        }
+    }
+
+    fn get(&self, key: &[FastKeyValue]) -> Option<usize> {
+        if let Some(map) = &self.map {
+            return map.get(key).copied();
+        }
+        self.entries
+            .iter()
+            .find_map(|(existing, group_id)| (existing.as_slice() == key).then_some(*group_id))
+    }
+
+    fn insert(&mut self, key: Vec<FastKeyValue>, group_id: usize) {
+        if let Some(map) = &mut self.map {
+            map.insert(key, group_id);
+            return;
+        }
+
+        self.entries.push((key, group_id));
+        if self.entries.len() > INLINE_FAST_GROUP_LIMIT {
+            self.promote();
+        }
+    }
+
+    fn promote(&mut self) {
+        let map = self.entries.iter().cloned().collect::<HashMap<_, _>>();
         self.map = Some(map);
     }
 }
