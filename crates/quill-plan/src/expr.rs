@@ -6,6 +6,7 @@ pub enum JitType {
     Date32,
     Int32,
     Int64,
+    UInt64,
     Float64,
     Utf8,
     Decimal128 { precision: u8, scale: i8 },
@@ -18,6 +19,7 @@ pub enum JitScalar {
     Date32(i32),
     Int32(i32),
     Int64(i64),
+    UInt64(u64),
     Float64(f64),
     Utf8(String),
     Decimal128 {
@@ -35,6 +37,7 @@ impl JitScalar {
             Self::Date32(_) => JitType::Date32,
             Self::Int32(_) => JitType::Int32,
             Self::Int64(_) => JitType::Int64,
+            Self::UInt64(_) => JitType::UInt64,
             Self::Float64(_) => JitType::Float64,
             Self::Utf8(_) => JitType::Utf8,
             Self::Decimal128 {
@@ -55,6 +58,7 @@ impl Display for JitScalar {
             Self::Date32(value) => write!(f, "{value}:date32"),
             Self::Int32(value) => write!(f, "{value}:i32"),
             Self::Int64(value) => write!(f, "{value}:i64"),
+            Self::UInt64(value) => write!(f, "{value}:u64"),
             Self::Float64(value) => write!(f, "{value}:f64"),
             Self::Utf8(value) => write!(f, "{value:?}:utf8"),
             Self::Decimal128 {
@@ -118,6 +122,11 @@ pub enum JitExpr {
         ty: JitType,
         nullable: bool,
     },
+    Cast {
+        expr: Box<JitExpr>,
+        ty: JitType,
+        nullable: bool,
+    },
     IsNull(Box<JitExpr>),
 }
 
@@ -127,6 +136,7 @@ impl JitExpr {
             Self::Column { ty, .. } => *ty,
             Self::Literal(value) => value.ty(),
             Self::Binary { ty, .. } => *ty,
+            Self::Cast { ty, .. } => *ty,
             Self::IsNull(_) => JitType::Bool,
         }
     }
@@ -137,6 +147,7 @@ impl JitExpr {
             Self::Literal(JitScalar::Null(_)) => true,
             Self::Literal(_) => false,
             Self::Binary { nullable, .. } => *nullable,
+            Self::Cast { nullable, .. } => *nullable,
             Self::IsNull(_) => false,
         }
     }
@@ -155,6 +166,7 @@ impl Display for JitExpr {
             Self::Binary {
                 op, left, right, ..
             } => write!(f, "({left} {op} {right})"),
+            Self::Cast { expr, ty, .. } => write!(f, "cast({expr} as {ty})"),
             Self::IsNull(arg) => write!(f, "is_null({arg})"),
         }
     }
@@ -182,6 +194,7 @@ impl Display for JitType {
             Self::Date32 => "date32",
             Self::Int32 => "i32",
             Self::Int64 => "i64",
+            Self::UInt64 => "u64",
             Self::Float64 => "f64",
             Self::Utf8 => "utf8",
             Self::Decimal128 { .. } => "decimal128",

@@ -16,6 +16,7 @@ pub(super) fn eval_expr(expr: &JitExpr, view: &BatchView<'_>, row: usize) -> Jit
             eval_expr(left, view, row)?,
             eval_expr(right, view, row)?,
         ),
+        JitExpr::Cast { expr, ty, .. } => eval_cast(eval_expr(expr, view, row)?, *ty),
         JitExpr::IsNull(arg) => Ok(Scalar::Bool(Some(eval_expr(arg, view, row)?.is_null()))),
     }
 }
@@ -24,6 +25,10 @@ pub(super) fn ensure_supported_expr(expr: &JitExpr) -> JitResult<()> {
     match expr {
         JitExpr::Column { .. } | JitExpr::Literal(_) => Ok(()),
         JitExpr::IsNull(arg) => ensure_supported_expr(arg),
+        JitExpr::Cast { expr, ty, .. } => {
+            ensure_supported_cast(expr.ty(), *ty)?;
+            ensure_supported_expr(expr)
+        }
         JitExpr::Binary {
             op, left, right, ..
         } => {
@@ -38,6 +43,41 @@ pub(super) fn ensure_supported_expr(expr: &JitExpr) -> JitResult<()> {
     }
 }
 
+fn eval_cast(value: Scalar, ty: JitType) -> JitResult<Scalar> {
+    if value.ty() == ty {
+        return Ok(value);
+    }
+
+    match (value, ty) {
+        (Scalar::Int32(value), JitType::Int64) => Ok(Scalar::Int64(value.map(i64::from))),
+        (Scalar::Int32(value), JitType::Float64) => Ok(Scalar::Float64(value.map(f64::from))),
+        (Scalar::Int64(value), JitType::Float64) => Ok(Scalar::Float64(value.map(|v| v as f64))),
+        (Scalar::UInt64(value), JitType::Float64) => Ok(Scalar::Float64(value.map(|v| v as f64))),
+        (Scalar::UInt64(value), JitType::Int64) => {
+            let value = value.map(i64::try_from).transpose().map_err(|_| {
+                JitError::UnsupportedExpr("UInt64 cast to Int64 overflow".to_string())
+            })?;
+            Ok(Scalar::Int64(value))
+        }
+        (value, ty) => Err(JitError::UnsupportedExpr(format!(
+            "cast from {:?} to {ty:?} is not supported",
+            value.ty()
+        ))),
+    }
+}
+
+fn ensure_supported_cast(from: JitType, to: JitType) -> JitResult<()> {
+    match (from, to) {
+        (from, to) if from == to => Ok(()),
+        (JitType::Int32, JitType::Int64 | JitType::Float64)
+        | (JitType::Int64, JitType::Float64)
+        | (JitType::UInt64, JitType::Int64 | JitType::Float64) => Ok(()),
+        (from, to) => Err(JitError::UnsupportedExpr(format!(
+            "cast from {from:?} to {to:?} is not supported"
+        ))),
+    }
+}
+
 fn eval_literal(value: &JitScalar) -> Scalar {
     match value {
         JitScalar::Null(ty) => match ty {
@@ -45,6 +85,7 @@ fn eval_literal(value: &JitScalar) -> Scalar {
             JitType::Date32 => Scalar::Date32(None),
             JitType::Int32 => Scalar::Int32(None),
             JitType::Int64 => Scalar::Int64(None),
+            JitType::UInt64 => Scalar::UInt64(None),
             JitType::Float64 => Scalar::Float64(None),
             JitType::Utf8 => Scalar::Utf8(None),
             JitType::Decimal128 { precision, scale } => Scalar::Decimal128 {
@@ -57,6 +98,7 @@ fn eval_literal(value: &JitScalar) -> Scalar {
         JitScalar::Date32(value) => Scalar::Date32(Some(*value)),
         JitScalar::Int32(value) => Scalar::Int32(Some(*value)),
         JitScalar::Int64(value) => Scalar::Int64(Some(*value)),
+        JitScalar::UInt64(value) => Scalar::UInt64(Some(*value)),
         JitScalar::Float64(value) => Scalar::Float64(Some(*value)),
         JitScalar::Utf8(value) => Scalar::Utf8(Some(Arc::from(value.as_str()))),
         JitScalar::Decimal128 {
@@ -100,6 +142,14 @@ fn eval_arithmetic(op: JitBinaryOp, lhs: Scalar, rhs: Scalar) -> JitResult<Scala
             },
         ))),
         (Scalar::Int64(lhs), Scalar::Int64(rhs)) => Ok(Scalar::Int64(option_zip(lhs, rhs).map(
+            |(lhs, rhs)| match op {
+                JitBinaryOp::Add => lhs + rhs,
+                JitBinaryOp::Sub => lhs - rhs,
+                JitBinaryOp::Mul => lhs * rhs,
+                _ => unreachable!(),
+            },
+        ))),
+        (Scalar::UInt64(lhs), Scalar::UInt64(rhs)) => Ok(Scalar::UInt64(option_zip(lhs, rhs).map(
             |(lhs, rhs)| match op {
                 JitBinaryOp::Add => lhs + rhs,
                 JitBinaryOp::Sub => lhs - rhs,
@@ -155,6 +205,9 @@ fn eval_comparison(op: JitBinaryOp, lhs: Scalar, rhs: Scalar) -> JitResult<Scala
             option_zip(lhs, rhs).map(|(lhs, rhs)| compare_ord(op, lhs, rhs))
         }
         (Scalar::Int64(lhs), Scalar::Int64(rhs)) => {
+            option_zip(lhs, rhs).map(|(lhs, rhs)| compare_ord(op, lhs, rhs))
+        }
+        (Scalar::UInt64(lhs), Scalar::UInt64(rhs)) => {
             option_zip(lhs, rhs).map(|(lhs, rhs)| compare_ord(op, lhs, rhs))
         }
         (Scalar::Float64(lhs), Scalar::Float64(rhs)) => {

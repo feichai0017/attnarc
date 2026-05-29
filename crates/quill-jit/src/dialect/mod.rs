@@ -315,14 +315,6 @@ fn append_group_aggregate(
         values.push(emitter.emit_expr(key)?);
     }
     for aggregate in aggregates {
-        if aggregate.expr.ty() != aggregate.output_type {
-            return Err(JitError::UnsupportedExpr(format!(
-                "group aggregate {} output type {:?} does not match expression type {:?}",
-                aggregate.alias,
-                aggregate.output_type,
-                aggregate.expr.ty()
-            )));
-        }
         values.push(emitter.emit_expr(&aggregate.expr)?);
     }
 
@@ -412,6 +404,10 @@ impl RegionEmitter {
             JitExpr::Binary {
                 op, left, right, ..
             } => self.emit_binary(*op, left, right),
+            JitExpr::Cast { expr, ty, .. } => {
+                let value = self.emit_expr(expr)?;
+                self.emit_cast(value, *ty)
+            }
             JitExpr::IsNull(_) => Err(JitError::UnsupportedExpr(
                 "Quill dialect regions do not yet model Arrow validity bitmaps".to_string(),
             )),
@@ -434,6 +430,7 @@ impl RegionEmitter {
             JitScalar::Date32(value) => value.to_string(),
             JitScalar::Int32(value) => value.to_string(),
             JitScalar::Int64(value) => value.to_string(),
+            JitScalar::UInt64(value) => value.to_string(),
             JitScalar::Float64(value) => format_float(*value),
             JitScalar::Utf8(_) => {
                 return Err(JitError::UnsupportedExpr(
@@ -471,6 +468,34 @@ impl RegionEmitter {
         }
     }
 
+    fn emit_cast(&mut self, value: ScalarValueRef, ty: JitType) -> JitResult<ScalarValueRef> {
+        if value.ty == ty {
+            return Ok(value);
+        }
+
+        let opcode = match (value.ty, ty) {
+            (JitType::Int32, JitType::Int64) => "extsi",
+            (JitType::Int32 | JitType::Int64, JitType::Float64) => "sitofp",
+            (JitType::UInt64, JitType::Float64) => "uitofp",
+            (JitType::Float64, JitType::Int64) => "fptosi",
+            _ => {
+                return Err(JitError::UnsupportedExpr(format!(
+                    "cast from {} to {} is not supported",
+                    mlir_type(value.ty),
+                    mlir_type(ty)
+                )));
+            }
+        };
+        let result = self.next_value("cast");
+        self.lines.push(format!(
+            "{result} = arith.{opcode} {} : {} to {}",
+            value.name,
+            mlir_type(value.ty),
+            mlir_type(ty)
+        ));
+        Ok(ScalarValueRef { name: result, ty })
+    }
+
     fn emit_arithmetic(
         &mut self,
         op: JitBinaryOp,
@@ -479,15 +504,18 @@ impl RegionEmitter {
     ) -> JitResult<ScalarValueRef> {
         ensure_same_type(&lhs, &rhs)?;
         let opcode = match (op, lhs.ty) {
-            (JitBinaryOp::Add, JitType::Int32 | JitType::Int64 | JitType::Decimal128 { .. }) => {
-                "addi"
-            }
-            (JitBinaryOp::Sub, JitType::Int32 | JitType::Int64 | JitType::Decimal128 { .. }) => {
-                "subi"
-            }
-            (JitBinaryOp::Mul, JitType::Int32 | JitType::Int64 | JitType::Decimal128 { .. }) => {
-                "muli"
-            }
+            (
+                JitBinaryOp::Add,
+                JitType::Int32 | JitType::Int64 | JitType::UInt64 | JitType::Decimal128 { .. },
+            ) => "addi",
+            (
+                JitBinaryOp::Sub,
+                JitType::Int32 | JitType::Int64 | JitType::UInt64 | JitType::Decimal128 { .. },
+            ) => "subi",
+            (
+                JitBinaryOp::Mul,
+                JitType::Int32 | JitType::Int64 | JitType::UInt64 | JitType::Decimal128 { .. },
+            ) => "muli",
             (JitBinaryOp::Div, JitType::Int32 | JitType::Int64 | JitType::Decimal128 { .. }) => {
                 "divsi"
             }
@@ -562,6 +590,23 @@ impl RegionEmitter {
                     "Utf8 comparisons are not supported by MLIR lowering".to_string(),
                 ));
             }
+            JitType::UInt64 => {
+                let predicate = match op {
+                    JitBinaryOp::Eq => "eq",
+                    JitBinaryOp::NotEq => "ne",
+                    JitBinaryOp::Lt => "ult",
+                    JitBinaryOp::LtEq => "ule",
+                    JitBinaryOp::Gt => "ugt",
+                    JitBinaryOp::GtEq => "uge",
+                    _ => unreachable!(),
+                };
+                self.lines.push(format!(
+                    "{result} = arith.cmpi {predicate}, {}, {} : {}",
+                    lhs.name,
+                    rhs.name,
+                    mlir_type(lhs.ty)
+                ));
+            }
             JitType::Date32 | JitType::Int32 | JitType::Int64 | JitType::Decimal128 { .. } => {
                 let predicate = match op {
                     JitBinaryOp::Eq => "eq",
@@ -627,6 +672,7 @@ fn is_numeric_type(ty: JitType) -> bool {
         JitType::Date32
             | JitType::Int32
             | JitType::Int64
+            | JitType::UInt64
             | JitType::Float64
             | JitType::Decimal128 { .. }
     )
@@ -650,6 +696,7 @@ fn mlir_type(ty: JitType) -> &'static str {
         JitType::Date32 => "i32",
         JitType::Int32 => "i32",
         JitType::Int64 => "i64",
+        JitType::UInt64 => "i64",
         JitType::Float64 => "f64",
         JitType::Utf8 => "!quill.scalar",
         JitType::Decimal128 { .. } => "i128",

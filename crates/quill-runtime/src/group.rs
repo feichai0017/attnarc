@@ -11,6 +11,7 @@ use quill_plan::{
 
 use super::array::{BatchView, OutputBuilder};
 use super::eval::{ensure_supported_expr, eval_expr};
+use super::kernel::PipelineSpec;
 use super::value::Scalar;
 
 #[derive(Debug, Clone)]
@@ -19,6 +20,7 @@ pub struct GroupAggregateKernel {
     keys: Vec<JitExpr>,
     aggregates: Vec<GroupAggregate>,
     schema: ArrowSchemaRef,
+    spec: Option<PipelineSpec>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +37,7 @@ enum KeyValue {
     Date32(Option<i32>),
     Int32(Option<i32>),
     Int64(Option<i64>),
+    UInt64(Option<u64>),
     Utf8(Option<Arc<str>>),
     Decimal128 {
         value: Option<i128>,
@@ -47,6 +50,7 @@ enum KeyValue {
 enum AggregateState {
     Sum(Option<Scalar>),
     Count(i64),
+    Avg { sum: Option<Scalar>, count: u64 },
     Min(Option<Scalar>),
     Max(Option<Scalar>),
 }
@@ -72,11 +76,15 @@ impl GroupAggregateKernel {
                 "group aggregate requires at least one key and one aggregate".to_string(),
             ));
         }
-        if schema.fields().len() != keys.len() + aggregates.len() {
+        let aggregate_fields = aggregates
+            .iter()
+            .map(|aggregate| aggregate.state_types.len())
+            .sum::<usize>();
+        if schema.fields().len() != keys.len() + aggregate_fields {
             return Err(JitError::Backend(format!(
                 "group aggregate output schema has {} fields, expected {}",
                 schema.fields().len(),
-                keys.len() + aggregates.len()
+                keys.len() + aggregate_fields
             )));
         }
         if let Some(predicate) = &predicate {
@@ -96,11 +104,14 @@ impl GroupAggregateKernel {
             ensure_aggregate_expr(aggregate)?;
         }
 
+        let spec = PipelineSpec::group_aggregate(predicate.as_ref(), &keys, &aggregates);
+
         Ok(Self {
             predicate,
             keys,
             aggregates,
             schema,
+            spec,
         })
     }
 
@@ -122,6 +133,10 @@ impl GroupAggregateKernel {
         } else {
             ""
         }
+    }
+
+    pub fn spec(&self) -> Option<&PipelineSpec> {
+        self.spec.as_ref()
     }
 
     pub fn new_state(&self) -> GroupAggregateState {
@@ -169,12 +184,19 @@ impl GroupAggregateKernel {
             for (value, builder) in key.0.into_iter().zip(&mut builders) {
                 builder.append(value.into_scalar())?;
             }
-            for (aggregate, (state, builder)) in self.aggregates.iter().zip(
-                aggregates
-                    .into_iter()
-                    .zip(builders.iter_mut().skip(self.keys.len())),
-            ) {
-                builder.append(state.finish(aggregate)?)?;
+            let mut builder_index = self.keys.len();
+            for (aggregate, state) in self.aggregates.iter().zip(aggregates) {
+                let values = state.finish_states(aggregate)?;
+                for value in values {
+                    let builder = builders.get_mut(builder_index).ok_or_else(|| {
+                        JitError::Backend(format!(
+                            "missing output builder for aggregate {}",
+                            aggregate.alias
+                        ))
+                    })?;
+                    builder.append(value)?;
+                    builder_index += 1;
+                }
             }
         }
 
@@ -200,6 +222,10 @@ impl AggregateState {
         match aggregate.func {
             AggregateFunc::Sum => Self::Sum(None),
             AggregateFunc::Count => Self::Count(0),
+            AggregateFunc::Avg => Self::Avg {
+                sum: None,
+                count: 0,
+            },
             AggregateFunc::Min => Self::Min(None),
             AggregateFunc::Max => Self::Max(None),
         }
@@ -223,6 +249,17 @@ impl AggregateState {
                 }
                 Ok(())
             }
+            (Self::Avg { sum, count }, AggregateFunc::Avg) => {
+                if value.is_null() {
+                    return Ok(());
+                }
+                *sum = Some(match sum.take() {
+                    Some(current) => current.checked_add(value)?,
+                    None => value,
+                });
+                *count += 1;
+                Ok(())
+            }
             (Self::Min(min), AggregateFunc::Min) => update_minmax(min, value, Ordering::Less),
             (Self::Max(max), AggregateFunc::Max) => update_minmax(max, value, Ordering::Greater),
             (_, other) => Err(JitError::Backend(format!(
@@ -232,18 +269,37 @@ impl AggregateState {
         }
     }
 
-    fn finish(self, aggregate: &GroupAggregate) -> JitResult<Scalar> {
+    fn finish_states(self, aggregate: &GroupAggregate) -> JitResult<Vec<Scalar>> {
         match (self, aggregate.func) {
-            (Self::Sum(value), AggregateFunc::Sum) => coerce_scalar(
-                value.unwrap_or_else(|| null_scalar(aggregate.output_type)),
-                aggregate.output_type,
-            ),
-            (Self::Count(value), AggregateFunc::Count) => Ok(Scalar::Int64(Some(value))),
+            (Self::Sum(value), AggregateFunc::Sum) => {
+                ensure_state_len(aggregate, 1)?;
+                let ty = aggregate.state_types[0];
+                Ok(vec![coerce_scalar(
+                    value.unwrap_or_else(|| null_scalar(ty)),
+                    ty,
+                )?])
+            }
+            (Self::Count(value), AggregateFunc::Count) => {
+                ensure_state_len(aggregate, 1)?;
+                let ty = aggregate.state_types[0];
+                Ok(vec![coerce_scalar(Scalar::Int64(Some(value)), ty)?])
+            }
+            (Self::Avg { sum, count }, AggregateFunc::Avg) => {
+                ensure_state_len(aggregate, 2)?;
+                let count_ty = aggregate.state_types[0];
+                let sum_ty = aggregate.state_types[1];
+                Ok(vec![
+                    coerce_scalar(Scalar::UInt64(Some(count)), count_ty)?,
+                    coerce_scalar(sum.unwrap_or_else(|| null_scalar(sum_ty)), sum_ty)?,
+                ])
+            }
             (Self::Min(value), AggregateFunc::Min) | (Self::Max(value), AggregateFunc::Max) => {
-                coerce_scalar(
-                    value.unwrap_or_else(|| null_scalar(aggregate.output_type)),
-                    aggregate.output_type,
-                )
+                ensure_state_len(aggregate, 1)?;
+                let ty = aggregate.state_types[0];
+                Ok(vec![coerce_scalar(
+                    value.unwrap_or_else(|| null_scalar(ty)),
+                    ty,
+                )?])
             }
             (_, other) => Err(JitError::Backend(format!(
                 "aggregate state does not match function {}",
@@ -260,6 +316,7 @@ impl KeyValue {
             Scalar::Date32(value) => Ok(Self::Date32(value)),
             Scalar::Int32(value) => Ok(Self::Int32(value)),
             Scalar::Int64(value) => Ok(Self::Int64(value)),
+            Scalar::UInt64(value) => Ok(Self::UInt64(value)),
             Scalar::Utf8(value) => Ok(Self::Utf8(value)),
             Scalar::Decimal128 {
                 value,
@@ -282,6 +339,7 @@ impl KeyValue {
             Self::Date32(value) => Scalar::Date32(value),
             Self::Int32(value) => Scalar::Int32(value),
             Self::Int64(value) => Scalar::Int64(value),
+            Self::UInt64(value) => Scalar::UInt64(value),
             Self::Utf8(value) => Scalar::Utf8(value),
             Self::Decimal128 {
                 value,
@@ -302,6 +360,7 @@ fn ensure_group_key_type(ty: JitType) -> JitResult<()> {
         | JitType::Date32
         | JitType::Int32
         | JitType::Int64
+        | JitType::UInt64
         | JitType::Utf8
         | JitType::Decimal128 { .. } => Ok(()),
         JitType::Float64 => Err(JitError::UnsupportedType(
@@ -322,11 +381,20 @@ fn ensure_aggregate_expr(aggregate: &GroupAggregate) -> JitResult<()> {
             ))),
         },
         AggregateFunc::Count => Ok(()),
+        AggregateFunc::Avg => match aggregate.expr.ty() {
+            JitType::Int32 | JitType::Int64 | JitType::Float64 | JitType::Decimal128 { .. } => {
+                Ok(())
+            }
+            other => Err(JitError::UnsupportedType(format!(
+                "AVG does not support {other:?}"
+            ))),
+        },
         AggregateFunc::Min | AggregateFunc::Max => match aggregate.expr.ty() {
             JitType::Bool
             | JitType::Date32
             | JitType::Int32
             | JitType::Int64
+            | JitType::UInt64
             | JitType::Float64
             | JitType::Utf8
             | JitType::Decimal128 { .. } => Ok(()),
@@ -355,6 +423,7 @@ fn null_scalar(ty: JitType) -> Scalar {
         JitType::Date32 => Scalar::Date32(None),
         JitType::Int32 => Scalar::Int32(None),
         JitType::Int64 => Scalar::Int64(None),
+        JitType::UInt64 => Scalar::UInt64(None),
         JitType::Float64 => Scalar::Float64(None),
         JitType::Utf8 => Scalar::Utf8(None),
         JitType::Decimal128 { precision, scale } => Scalar::Decimal128 {
@@ -368,6 +437,19 @@ fn null_scalar(ty: JitType) -> Scalar {
 fn coerce_scalar(value: Scalar, ty: JitType) -> JitResult<Scalar> {
     match (value, ty) {
         (Scalar::Int32(value), JitType::Int64) => Ok(Scalar::Int64(value.map(i64::from))),
+        (Scalar::Int64(value), JitType::UInt64) => {
+            let value = value.map(u64::try_from).transpose().map_err(|_| {
+                JitError::Backend("negative count cannot coerce to UInt64".to_string())
+            })?;
+            Ok(Scalar::UInt64(value))
+        }
+        (Scalar::UInt64(value), JitType::Int64) => {
+            let value = value
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|_| JitError::Backend("UInt64 count does not fit in Int64".to_string()))?;
+            Ok(Scalar::Int64(value))
+        }
         (Scalar::Decimal128 { value, .. }, JitType::Decimal128 { precision, scale }) => {
             Ok(Scalar::Decimal128 {
                 value,
@@ -382,4 +464,16 @@ fn coerce_scalar(value: Scalar, ty: JitType) -> JitResult<Scalar> {
             ty
         ))),
     }
+}
+
+fn ensure_state_len(aggregate: &GroupAggregate, expected: usize) -> JitResult<()> {
+    if aggregate.state_types.len() == expected {
+        return Ok(());
+    }
+    Err(JitError::Backend(format!(
+        "aggregate {} expects {} state fields, got {}",
+        aggregate.alias,
+        expected,
+        aggregate.state_types.len()
+    )))
 }

@@ -3,7 +3,7 @@ use serde::Serialize;
 
 use std::collections::BTreeMap;
 
-use quill_plan::{JitExpr, JitProjection, JitResult, JitType};
+use quill_plan::{AggregateFunc, GroupAggregate, JitExpr, JitProjection, JitResult, JitType};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FixedColumn {
@@ -32,6 +32,12 @@ pub enum PipelineSpec {
     PlainSum {
         columns: Vec<FixedColumn>,
         output_type: JitType,
+    },
+    GroupAggregate {
+        columns: Vec<FixedColumn>,
+        key_types: Vec<JitType>,
+        aggregate_funcs: Vec<AggregateFunc>,
+        state_types: Vec<JitType>,
     },
 }
 
@@ -82,11 +88,46 @@ impl PipelineSpec {
         })
     }
 
+    pub fn group_aggregate(
+        predicate: Option<&JitExpr>,
+        keys: &[JitExpr],
+        aggregates: &[GroupAggregate],
+    ) -> Option<Self> {
+        if keys.is_empty() || aggregates.is_empty() {
+            return None;
+        }
+
+        let mut columns = BTreeMap::new();
+        if let Some(predicate) = predicate {
+            if predicate.ty() != JitType::Bool {
+                return None;
+            }
+            collect_fixed_width_columns(predicate, &mut columns)?;
+        }
+        for aggregate in aggregates {
+            collect_fixed_width_columns(&aggregate.expr, &mut columns)?;
+        }
+
+        Some(Self::GroupAggregate {
+            columns: columns
+                .into_iter()
+                .map(|(index, ty)| FixedColumn { index, ty })
+                .collect(),
+            key_types: keys.iter().map(JitExpr::ty).collect(),
+            aggregate_funcs: aggregates.iter().map(|aggregate| aggregate.func).collect(),
+            state_types: aggregates
+                .iter()
+                .flat_map(|aggregate| aggregate.state_types.iter().copied())
+                .collect(),
+        })
+    }
+
     pub fn kind(&self) -> KernelKind {
         match self {
             Self::Generic { kind } => *kind,
             Self::RecordProject { .. } => KernelKind::FilterProject,
             Self::PlainSum { .. } => KernelKind::FilterSum,
+            Self::GroupAggregate { .. } => KernelKind::GroupAggregate,
         }
     }
 
@@ -95,6 +136,7 @@ impl PipelineSpec {
             Self::Generic { kind } => kind.name(),
             Self::RecordProject { .. } => "record_project",
             Self::PlainSum { .. } => "plain_sum",
+            Self::GroupAggregate { .. } => "group_aggregate",
         }
     }
 }
@@ -197,6 +239,10 @@ fn collect_fixed_width_columns(
             collect_fixed_width_columns(left, columns)?;
             collect_fixed_width_columns(right, columns)
         }
+        JitExpr::Cast { expr, ty, .. } => {
+            ensure_fixed_width_type(*ty)?;
+            collect_fixed_width_columns(expr, columns)
+        }
         JitExpr::IsNull(_) => None,
     }
 }
@@ -206,7 +252,7 @@ fn ensure_fixed_width_type(ty: JitType) -> Option<()> {
         JitType::Date32 | JitType::Int64 | JitType::Float64 | JitType::Decimal128 { .. } => {
             Some(())
         }
-        JitType::Bool | JitType::Int32 | JitType::Utf8 => None,
+        JitType::Bool | JitType::Int32 | JitType::UInt64 | JitType::Utf8 => None,
     }
 }
 
@@ -215,7 +261,7 @@ fn ensure_record_output_type(ty: JitType) -> Option<()> {
         JitType::Date32 | JitType::Int64 | JitType::Float64 | JitType::Decimal128 { .. } => {
             Some(())
         }
-        JitType::Bool | JitType::Int32 | JitType::Utf8 => None,
+        JitType::Bool | JitType::Int32 | JitType::UInt64 | JitType::Utf8 => None,
     }
 }
 

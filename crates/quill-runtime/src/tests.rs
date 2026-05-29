@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array, StringArray,
+    UInt64Array,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -520,6 +521,71 @@ fn executes_group_aggregate_with_utf8_key() {
     assert!(mins.is_null(0));
     assert_eq!(mins.value(1), "A");
     assert_eq!(mins.value(2), "B");
+}
+
+#[test]
+fn executes_group_avg_as_partial_state() {
+    let input_schema = Arc::new(Schema::new(vec![
+        Field::new("flag", DataType::Utf8, false),
+        Field::new("v", DataType::Int64, true),
+    ]));
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("flag", DataType::Utf8, false),
+        Field::new("avg_v[count]", DataType::UInt64, false),
+        Field::new("avg_v[sum]", DataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        input_schema,
+        vec![
+            Arc::new(StringArray::from(vec!["A", "A", "B", "B"])),
+            Arc::new(Int64Array::from(vec![Some(10), Some(20), Some(30), None])),
+        ],
+    )
+    .unwrap();
+    let key = JitExpr::Column {
+        index: 0,
+        name: "flag".to_string(),
+        ty: JitType::Utf8,
+        nullable: false,
+    };
+    let value = JitExpr::Column {
+        index: 1,
+        name: "v".to_string(),
+        ty: JitType::Int64,
+        nullable: true,
+    };
+    let aggregate = GroupAggregate::new_with_states(
+        AggregateFunc::Avg,
+        value,
+        vec![JitType::UInt64, JitType::Int64],
+        "avg_v",
+    );
+    let kernel =
+        GroupAggregateKernel::try_new(&[], vec![key], vec![aggregate], output_schema).unwrap();
+    let mut state = kernel.new_state();
+    kernel.accumulate(&mut state, &batch).unwrap();
+    let output = kernel.finish(state).unwrap();
+
+    let keys = output
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let counts = output
+        .column(1)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    let sums = output
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+
+    assert_eq!(keys.value(0), "A");
+    assert_eq!(keys.value(1), "B");
+    assert_eq!(counts.values().as_ref(), &[2, 1]);
+    assert_eq!(sums.values().as_ref(), &[30, 30]);
 }
 
 fn and(left: JitExpr, right: JitExpr) -> JitExpr {

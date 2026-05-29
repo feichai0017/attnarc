@@ -3,7 +3,7 @@ use std::sync::Arc;
 use datafusion::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::Operator;
-use datafusion::physical_expr::expressions::{BinaryExpr, Column, IsNullExpr, Literal};
+use datafusion::physical_expr::expressions::{BinaryExpr, CastExpr, Column, IsNullExpr, Literal};
 use datafusion::physical_expr::PhysicalExpr;
 use quill_plan::{JitBinaryOp, JitError, JitExpr, JitResult, JitScalar, JitType};
 
@@ -43,6 +43,18 @@ pub(crate) fn from_physical(
         });
     }
 
+    if let Some(cast) = expr.as_any().downcast_ref::<CastExpr>() {
+        let arg = from_physical(cast.expr(), input_schema)?;
+        let nullable = expr.nullable(input_schema).map_err(|err| {
+            JitError::UnsupportedExpr(format!("cannot infer cast expression nullability: {err}"))
+        })?;
+        return Ok(JitExpr::Cast {
+            expr: Box::new(arg),
+            ty: jit_type(cast.cast_type())?,
+            nullable,
+        });
+    }
+
     if let Some(is_null) = expr.as_any().downcast_ref::<IsNullExpr>() {
         let arg = from_physical(is_null.arg(), input_schema)?;
         return Ok(JitExpr::IsNull(Box::new(arg)));
@@ -57,6 +69,7 @@ pub(crate) fn jit_type(data_type: &ArrowDataType) -> JitResult<JitType> {
         ArrowDataType::Date32 => Ok(JitType::Date32),
         ArrowDataType::Int32 => Ok(JitType::Int32),
         ArrowDataType::Int64 => Ok(JitType::Int64),
+        ArrowDataType::UInt64 => Ok(JitType::UInt64),
         ArrowDataType::Float64 => Ok(JitType::Float64),
         ArrowDataType::Utf8 => Ok(JitType::Utf8),
         ArrowDataType::Decimal128(precision, scale) => Ok(JitType::Decimal128 {
@@ -78,6 +91,8 @@ fn jit_scalar(value: &ScalarValue) -> JitResult<JitScalar> {
         ScalarValue::Int32(None) => Ok(JitScalar::Null(JitType::Int32)),
         ScalarValue::Int64(Some(value)) => Ok(JitScalar::Int64(*value)),
         ScalarValue::Int64(None) => Ok(JitScalar::Null(JitType::Int64)),
+        ScalarValue::UInt64(Some(value)) => Ok(JitScalar::UInt64(*value)),
+        ScalarValue::UInt64(None) => Ok(JitScalar::Null(JitType::UInt64)),
         ScalarValue::Float64(Some(value)) => Ok(JitScalar::Float64(*value)),
         ScalarValue::Float64(None) => Ok(JitScalar::Null(JitType::Float64)),
         ScalarValue::Utf8(Some(value)) => Ok(JitScalar::Utf8(value.clone())),

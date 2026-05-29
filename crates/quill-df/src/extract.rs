@@ -390,11 +390,16 @@ fn lower_group_aggregates(
                 }
                 _ => return None,
             };
-            let output_type = crate::expr::jit_type(expr.field().data_type()).ok()?;
-            Some(GroupAggregate::new(
+            let state_types = expr
+                .state_fields()
+                .ok()?
+                .iter()
+                .map(|field| crate::expr::jit_type(field.data_type()).ok())
+                .collect::<Option<Vec<_>>>()?;
+            Some(GroupAggregate::new_with_states(
                 func,
                 measure,
-                output_type,
+                state_types,
                 expr.name().to_string(),
             ))
         })
@@ -406,6 +411,8 @@ fn aggregate_func(name: &str) -> Option<AggregateFunc> {
         Some(AggregateFunc::Sum)
     } else if name.eq_ignore_ascii_case("count") {
         Some(AggregateFunc::Count)
+    } else if name.eq_ignore_ascii_case("avg") {
+        Some(AggregateFunc::Avg)
     } else if name.eq_ignore_ascii_case("min") {
         Some(AggregateFunc::Min)
     } else if name.eq_ignore_ascii_case("max") {
@@ -465,6 +472,11 @@ fn remap_projection_columns(
             op: *op,
             left: Box::new(remap_projection_columns(left, projection, input_schema)?),
             right: Box::new(remap_projection_columns(right, projection, input_schema)?),
+            ty: *ty,
+            nullable: *nullable,
+        }),
+        JitExpr::Cast { expr, ty, nullable } => Some(JitExpr::Cast {
+            expr: Box::new(remap_projection_columns(expr, projection, input_schema)?),
             ty: *ty,
             nullable: *nullable,
         }),

@@ -9,6 +9,7 @@ pub(super) enum Scalar {
     Date32(Option<i32>),
     Int32(Option<i32>),
     Int64(Option<i64>),
+    UInt64(Option<u64>),
     Float64(Option<f64>),
     Utf8(Option<Arc<str>>),
     Decimal128 {
@@ -35,6 +36,7 @@ impl Scalar {
             Self::Date32(_) => JitType::Date32,
             Self::Int32(_) => JitType::Int32,
             Self::Int64(_) => JitType::Int64,
+            Self::UInt64(_) => JitType::UInt64,
             Self::Float64(_) => JitType::Float64,
             Self::Utf8(_) => JitType::Utf8,
             Self::Decimal128 {
@@ -52,6 +54,7 @@ impl Scalar {
             Self::Date32(value) => value.is_none(),
             Self::Int32(value) => value.is_none(),
             Self::Int64(value) => value.is_none(),
+            Self::UInt64(value) => value.is_none(),
             Self::Float64(value) => value.is_none(),
             Self::Utf8(value) => value.is_none(),
             Self::Decimal128 { value, .. } => value.is_none(),
@@ -67,6 +70,9 @@ impl Scalar {
             }
             (Self::Int64(lhs), Self::Int64(rhs)) => {
                 Ok(Self::Int64(add_options(lhs, rhs, i64::wrapping_add)))
+            }
+            (Self::UInt64(lhs), Self::UInt64(rhs)) => {
+                Ok(Self::UInt64(add_options(lhs, rhs, u64::wrapping_add)))
             }
             (Self::Float64(lhs), Self::Float64(rhs)) => {
                 Ok(Self::Float64(add_options(lhs, rhs, |lhs, rhs| lhs + rhs)))
@@ -112,6 +118,9 @@ impl Scalar {
                 Ok(option_zip(lhs, rhs).map(|(lhs, rhs)| lhs.cmp(&rhs)))
             }
             (Self::Int64(lhs), Self::Int64(rhs)) => {
+                Ok(option_zip(lhs, rhs).map(|(lhs, rhs)| lhs.cmp(&rhs)))
+            }
+            (Self::UInt64(lhs), Self::UInt64(rhs)) => {
                 Ok(option_zip(lhs, rhs).map(|(lhs, rhs)| lhs.cmp(&rhs)))
             }
             (Self::Float64(lhs), Self::Float64(rhs)) => {

@@ -87,11 +87,12 @@ impl<'a> PipelineCompiler<'a> {
                     Ok(runtime) => runtime,
                     Err(_) => return Ok(None),
                 };
+                let kernel = self.group_aggregate_kernel(&runtime);
                 let exec = CompiledPipelineExec::try_new(
                     input,
                     PipelineRuntime::GroupAggregate(runtime),
                     output_schema,
-                    self.group_aggregate_kernel(),
+                    kernel,
                 )?;
                 Ok(Some(Arc::new(exec) as Arc<dyn ExecutionPlan>))
             }
@@ -142,13 +143,12 @@ impl<'a> PipelineCompiler<'a> {
         )
     }
 
-    fn group_aggregate_kernel(&self) -> CompiledKernel {
-        CompiledKernel::new(
-            "group_aggregate",
-            KernelKind::GroupAggregate,
-            "quill-runtime",
-            false,
-        )
+    fn group_aggregate_kernel(&self, runtime: &GroupAggregateKernel) -> CompiledKernel {
+        let spec = runtime
+            .spec()
+            .cloned()
+            .unwrap_or_else(|| PipelineSpec::generic(KernelKind::GroupAggregate));
+        CompiledKernel::with_spec("group_aggregate", spec, "quill-runtime", false)
     }
 
     fn kernel_backend_name(&self, executable: bool) -> &str {

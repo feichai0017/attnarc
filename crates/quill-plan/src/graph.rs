@@ -198,6 +198,7 @@ pub enum PipelineKind {
 pub enum AggregateFunc {
     Sum,
     Count,
+    Avg,
     Min,
     Max,
 }
@@ -207,6 +208,7 @@ impl AggregateFunc {
         match self {
             Self::Sum => "sum",
             Self::Count => "count",
+            Self::Avg => "avg",
             Self::Min => "min",
             Self::Max => "max",
         }
@@ -218,6 +220,7 @@ pub struct GroupAggregate {
     pub func: AggregateFunc,
     pub expr: JitExpr,
     pub output_type: JitType,
+    pub state_types: Vec<JitType>,
     pub alias: String,
 }
 
@@ -232,6 +235,23 @@ impl GroupAggregate {
             func,
             expr,
             output_type,
+            state_types: vec![output_type],
+            alias: alias.into(),
+        }
+    }
+
+    pub fn new_with_states(
+        func: AggregateFunc,
+        expr: JitExpr,
+        state_types: Vec<JitType>,
+        alias: impl Into<String>,
+    ) -> Self {
+        let output_type = state_types.first().copied().unwrap_or_else(|| expr.ty());
+        Self {
+            func,
+            expr,
+            output_type,
+            state_types,
             alias: alias.into(),
         }
     }
