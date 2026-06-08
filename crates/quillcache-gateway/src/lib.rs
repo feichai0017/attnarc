@@ -6,8 +6,12 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use quillcache_control::{ControlPlane, IngestSummary};
 use quillcache_core::{
-    EngineEndpoint, ExternalKvBlockKey, KvBlockKey, KvEventBatch, RequestKvHints, RequestShape,
-    SloTarget,
+    EngineEndpoint, ExternalKvBlockKey, KvBlockKey, KvEventBatch, MemoryIndex, RequestKvHints,
+    RequestShape, SloTarget,
+};
+use quillcache_router::{
+    GreedyStatePlaneRouter, LeastLoadedRouter, PrefixAffinityRouter, RoundRobinRouter,
+    RoutingPolicy,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -50,6 +54,10 @@ pub enum GatewayError {
 pub struct GatewayConfig {
     pub bind: SocketAddr,
     pub engines: Vec<EngineEndpoint>,
+    /// Routing policy: "prefix-affinity" (cache-affine across the fleet),
+    /// "round-robin" (spread baseline), "least-loaded", or "greedy" (default).
+    #[serde(default)]
+    pub policy: Option<String>,
 }
 
 impl GatewayConfig {
@@ -95,8 +103,13 @@ pub async fn run_from_config_path(path: impl AsRef<Path>) -> Result<(), GatewayE
 }
 
 pub async fn run(config: GatewayConfig) -> Result<(), GatewayError> {
+    let policy = build_policy(config.policy.as_deref());
+    let policy_name = policy.name().to_string();
+    let control =
+        ControlPlane::with_index_and_policy(config.engines, Box::new(MemoryIndex::new()), policy);
+    tracing::info!(policy = %policy_name, "routing policy selected");
     let state = GatewayState {
-        control: Arc::new(RwLock::new(ControlPlane::new(config.engines))),
+        control: Arc::new(RwLock::new(control)),
         client: Client::new(),
     };
     let app = router(state);
@@ -111,6 +124,16 @@ pub async fn run(config: GatewayConfig) -> Result<(), GatewayError> {
     axum::serve(listener, app)
         .await
         .map_err(GatewayError::Serve)
+}
+
+/// Build a routing policy from its config name (default: cache-aware greedy).
+fn build_policy(name: Option<&str>) -> Box<dyn RoutingPolicy> {
+    match name.unwrap_or("greedy") {
+        "prefix-affinity" | "affinity" => Box::new(PrefixAffinityRouter::default()),
+        "round-robin" | "roundrobin" => Box::new(RoundRobinRouter::default()),
+        "least-loaded" | "load" => Box::new(LeastLoadedRouter::default()),
+        _ => Box::new(GreedyStatePlaneRouter::default()),
+    }
 }
 
 fn router(state: GatewayState) -> Router {

@@ -1045,6 +1045,7 @@ dependencies = [
  "axum",
  "quillcache-control",
  "quillcache-core",
+ "quillcache-router",
  "reqwest",
  "serde",
  "serde_json",
