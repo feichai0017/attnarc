@@ -3,7 +3,7 @@ use quillcache_core::{
     ExternalKvBlockKey, IdentityScope, IndexBackend, KvBlockKey, KvEvent, KvEventBatch,
     MemoryIndex, RequestShape, WorkerState,
 };
-use quillcache_router::{GreedyStatePlaneRouter, RouteDecision, RouterError};
+use quillcache_router::{GreedyStatePlaneRouter, RouteDecision, RouterError, RoutingPolicy};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use thiserror::Error;
@@ -158,7 +158,7 @@ fn apply_removed(
 pub struct ControlPlane {
     engines: Vec<EngineEndpoint>,
     workers: Vec<WorkerState>,
-    router: GreedyStatePlaneRouter,
+    router: Box<dyn RoutingPolicy>,
     residency: Box<dyn IndexBackend>,
 }
 
@@ -169,9 +169,23 @@ impl ControlPlane {
     }
 
     /// New control plane with a specific index backend (memory, Holt/ART,
-    /// RocksDB/LSM, filesystem). This is the runtime seam for Online mode to
-    /// pick a backend by config and for Experiment mode to compare them.
+    /// RocksDB/LSM, filesystem) and the default cache-aware router.
     pub fn with_index(engines: Vec<EngineEndpoint>, residency: Box<dyn IndexBackend>) -> Self {
+        Self::with_index_and_policy(
+            engines,
+            residency,
+            Box::new(GreedyStatePlaneRouter::default()),
+        )
+    }
+
+    /// New control plane with a specific index backend and routing policy — the
+    /// runtime seam for Online mode to pick both by config (e.g. prefix-affinity
+    /// vs round-robin across a real engine fleet).
+    pub fn with_index_and_policy(
+        engines: Vec<EngineEndpoint>,
+        residency: Box<dyn IndexBackend>,
+        router: Box<dyn RoutingPolicy>,
+    ) -> Self {
         let workers = engines
             .iter()
             .map(EngineEndpoint::worker_state)
@@ -179,7 +193,7 @@ impl ControlPlane {
         Self {
             engines,
             workers,
-            router: GreedyStatePlaneRouter::default(),
+            router,
             residency,
         }
     }

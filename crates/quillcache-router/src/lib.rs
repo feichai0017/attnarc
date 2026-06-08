@@ -2,7 +2,10 @@ use quillcache_core::{
     CacheResidency, CacheTier, CostModel, KvBlockKey, RequestShape, WorkerState,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -52,7 +55,7 @@ impl RouteDecision {
 /// Policies differ only in *which* worker they select; per-worker cost
 /// accounting is shared via [`plan_for_worker`], so comparisons stay apples to
 /// apples.
-pub trait RoutingPolicy {
+pub trait RoutingPolicy: std::fmt::Debug + Send + Sync {
     /// Stable policy name for reports (for example "greedy-state-plane").
     fn name(&self) -> &str;
 
@@ -240,6 +243,108 @@ impl RoutingPolicy for LeastLoadedRouter {
                 u64::from(worker.queued_prefill_tokens) + u64::from(worker.running_decodes) * 1_000
             })
             .ok_or(RouterError::NoWorkers)?;
+        let worker_by_id: HashMap<&str, &WorkerState> = workers
+            .iter()
+            .map(|worker| (worker.id.as_str(), worker))
+            .collect();
+        Ok(plan_for_worker(
+            &self.cost_model,
+            request,
+            target,
+            &worker_by_id,
+            residency,
+        ))
+    }
+}
+
+/// Cache-affine policy ("approximate" prefix-aware routing): hash the request's
+/// shared prefix to a worker, so every request carrying the same prefix lands on
+/// the same engine and reuses its prefix cache — no KV events required. This is
+/// the routing the cache-aware story rests on for a real multi-engine fleet.
+#[derive(Debug, Clone, Default)]
+pub struct PrefixAffinityRouter {
+    cost_model: CostModel,
+}
+
+impl PrefixAffinityRouter {
+    pub fn new(cost_model: CostModel) -> Self {
+        Self { cost_model }
+    }
+}
+
+impl RoutingPolicy for PrefixAffinityRouter {
+    fn name(&self) -> &str {
+        "prefix-affinity"
+    }
+
+    fn route(
+        &self,
+        request: &RequestShape,
+        workers: &[WorkerState],
+        residency: &[CacheResidency],
+    ) -> Result<RouteDecision, RouterError> {
+        if workers.is_empty() {
+            return Err(RouterError::NoWorkers);
+        }
+        // Hash the longest shared prefix (the first block's prefix_hash) so that
+        // requests sharing a system prompt / session map to the same worker.
+        let affinity_key = request
+            .blocks
+            .first()
+            .map(|block| block.prefix_hash.as_str())
+            .unwrap_or(request.id.as_str());
+        let mut hasher = DefaultHasher::new();
+        affinity_key.hash(&mut hasher);
+        let idx = (hasher.finish() % workers.len() as u64) as usize;
+        let target = &workers[idx];
+        let worker_by_id: HashMap<&str, &WorkerState> = workers
+            .iter()
+            .map(|worker| (worker.id.as_str(), worker))
+            .collect();
+        Ok(plan_for_worker(
+            &self.cost_model,
+            request,
+            target,
+            &worker_by_id,
+            residency,
+        ))
+    }
+}
+
+/// Spread baseline: round-robin across workers, ignoring prefix and cache — a
+/// fair "no affinity" comparison for [`PrefixAffinityRouter`]. The same prefix is
+/// scattered across the fleet, so each engine recomputes it.
+#[derive(Debug, Default)]
+pub struct RoundRobinRouter {
+    cost_model: CostModel,
+    next: AtomicUsize,
+}
+
+impl RoundRobinRouter {
+    pub fn new(cost_model: CostModel) -> Self {
+        Self {
+            cost_model,
+            next: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl RoutingPolicy for RoundRobinRouter {
+    fn name(&self) -> &str {
+        "round-robin"
+    }
+
+    fn route(
+        &self,
+        request: &RequestShape,
+        workers: &[WorkerState],
+        residency: &[CacheResidency],
+    ) -> Result<RouteDecision, RouterError> {
+        if workers.is_empty() {
+            return Err(RouterError::NoWorkers);
+        }
+        let idx = self.next.fetch_add(1, Ordering::Relaxed) % workers.len();
+        let target = &workers[idx];
         let worker_by_id: HashMap<&str, &WorkerState> = workers
             .iter()
             .map(|worker| (worker.id.as_str(), worker))
