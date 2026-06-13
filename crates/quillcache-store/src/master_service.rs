@@ -22,7 +22,9 @@ use crate::allocator::{AllocatedBuffer, BufferAllocator, OffsetBufferAllocator};
 use crate::replica::{Replica, ReplicaData, ReplicaList, ReplicaStatus};
 use crate::types::{ErrorCode, ObjectKey, ReplicaId, ReplicateConfig, SegmentName};
 use quillcache_core::IdentityScope;
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 /// Per-object control-plane metadata (server-side; never sent to clients).
 #[derive(Debug)]
@@ -44,6 +46,42 @@ impl ObjectMetadata {
     }
 }
 
+/// A serializable, consistent copy of the master's in-memory metadata — mounted
+/// segments, object replicas, leases/pins, allocation strategy, and the clock.
+/// Mooncake's periodic metadata snapshot, taken so a restarted master (or a
+/// newly-elected leader, under etcd HA) can rebuild state; changes after the last
+/// snapshot are lost (the same bound Mooncake documents).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MasterSnapshot {
+    pub version: u32,
+    pub strategy: String,
+    pub clock: u64,
+    pub lease_ttl: u64,
+    pub high_watermark: f64,
+    pub eviction_ratio: f64,
+    pub segment_ttl: u64,
+    pub next_replica_id: ReplicaId,
+    pub segments: Vec<SegmentSnapshot>,
+    pub objects: Vec<ObjectSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentSnapshot {
+    pub name: SegmentName,
+    pub capacity: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObjectSnapshot {
+    pub key: ObjectKey,
+    pub replicas: Vec<Replica>,
+    pub identity: IdentityScope,
+    pub lease_until: u64,
+    pub last_access: u64,
+    pub soft_pinned: bool,
+    pub hard_pinned: bool,
+}
+
 /// The store's metadata / allocation / eviction authority.
 #[derive(Debug)]
 pub struct MasterService {
@@ -51,11 +89,19 @@ pub struct MasterService {
     allocators: Vec<Box<dyn BufferAllocator>>,
     objects: HashMap<ObjectKey, ObjectMetadata>,
     strategy: Box<dyn AllocationStrategy>,
+    /// The allocation-strategy name, kept so a snapshot can rebuild the same one.
+    strategy_name: String,
     next_replica_id: ReplicaId,
     clock: u64,
     lease_ttl: u64,
     high_watermark: f64,
     eviction_ratio: f64,
+    /// Last logical-clock tick each segment's node heartbeated — Mooncake's
+    /// periodic client heartbeats, the basis for failure detection.
+    segment_heartbeat: HashMap<SegmentName, u64>,
+    /// Ticks a segment may miss before it is treated as dead. `0` disables the
+    /// health check (every mounted segment is considered alive).
+    segment_ttl: u64,
 }
 
 impl MasterService {
@@ -64,11 +110,14 @@ impl MasterService {
             allocators: Vec::new(),
             objects: HashMap::new(),
             strategy: create_allocation_strategy(strategy),
+            strategy_name: strategy.to_string(),
             next_replica_id: 0,
             clock: 0,
             lease_ttl: 5,
             high_watermark: 0.95,
             eviction_ratio: 0.1,
+            segment_heartbeat: HashMap::new(),
+            segment_ttl: 0,
         }
     }
 
@@ -82,6 +131,9 @@ impl MasterService {
     // ---- segment lifecycle (Mooncake's MountSegment / UnmountSegment) ----
 
     pub fn mount_segment(&mut self, name: impl Into<SegmentName>, capacity: u64) {
+        let name = name.into();
+        // A freshly-mounted segment is alive as of now.
+        self.segment_heartbeat.insert(name.clone(), self.clock);
         self.allocators
             .push(Box::new(OffsetBufferAllocator::new(name, capacity)));
     }
@@ -96,9 +148,51 @@ impl MasterService {
             obj.replicas.retain(|_, r| r.segment_name() != Some(name));
         }
         self.allocators.retain(|a| a.segment_name() != name);
+        self.segment_heartbeat.remove(name);
         // Objects left with no replicas are gone.
         self.objects.retain(|_, o| !o.replicas.is_empty());
         Ok(())
+    }
+
+    // ---- HA: heartbeat-based segment health (Mooncake's client heartbeats) ----
+
+    /// Enable failure detection: a segment that misses a heartbeat for more than
+    /// `ttl` logical ticks is treated as dead and its replicas are not handed
+    /// out. `0` disables the check (the default — every mounted segment is alive).
+    pub fn set_segment_ttl(&mut self, ttl: u64) {
+        self.segment_ttl = ttl;
+    }
+
+    /// Record a liveness heartbeat from a segment's node. Unknown segment → error.
+    pub fn heartbeat(&mut self, segment: &str) -> Result<(), ErrorCode> {
+        match self.segment_heartbeat.get_mut(segment) {
+            Some(last) => {
+                *last = self.clock;
+                Ok(())
+            }
+            None => Err(ErrorCode::SegmentNotFound),
+        }
+    }
+
+    /// Whether a mounted segment is alive (heartbeated within `segment_ttl`).
+    /// With the check disabled (`segment_ttl == 0`), any mounted segment is alive.
+    pub fn segment_alive(&self, segment: &str) -> bool {
+        match self.segment_heartbeat.get(segment) {
+            Some(&last) => {
+                self.segment_ttl == 0 || self.clock.saturating_sub(last) <= self.segment_ttl
+            }
+            None => false,
+        }
+    }
+
+    /// Mounted segments that have missed heartbeats past the TTL — failure
+    /// detection surfaces them so the control plane can re-replicate / route away.
+    pub fn dead_segments(&self) -> Vec<String> {
+        self.allocators
+            .iter()
+            .map(|a| a.segment_name().to_string())
+            .filter(|name| !self.segment_alive(name))
+            .collect()
     }
 
     // ---- two-phase Put ----
@@ -173,6 +267,14 @@ impl MasterService {
     ) -> Result<Vec<Replica>, ErrorCode> {
         let now = self.clock;
         let lease_ttl = self.lease_ttl;
+        // Failure detection: a Memory replica on a segment whose node stopped
+        // heartbeating is treated as lost; a Disk replica is durable, so kept.
+        let alive: HashSet<String> = self
+            .allocators
+            .iter()
+            .map(|a| a.segment_name().to_string())
+            .filter(|name| self.segment_alive(name))
+            .collect();
         let object = self.objects.get_mut(key).ok_or(ErrorCode::ObjectNotFound)?;
         // QuillCache identity guard: a content-hash key can be requested under a
         // different identity — refuse cross-tenant / cross-adapter / cross-model.
@@ -183,6 +285,10 @@ impl MasterService {
             .replicas
             .values()
             .filter(|r| r.is_complete())
+            .filter(|r| match r.segment_name() {
+                Some(seg) => alive.contains(seg),
+                None => true,
+            })
             .cloned()
             .collect();
         if complete.is_empty() {
@@ -227,6 +333,113 @@ impl MasterService {
     }
     pub fn allocated(&self) -> u64 {
         self.allocators.iter().map(|a| a.allocated()).sum()
+    }
+
+    // ---- HA: snapshot + recovery (Mooncake's metadata snapshot thread) ----
+
+    /// Take a consistent [`MasterSnapshot`] of the current in-memory metadata.
+    pub fn snapshot(&self) -> MasterSnapshot {
+        MasterSnapshot {
+            version: 1,
+            strategy: self.strategy_name.clone(),
+            clock: self.clock,
+            lease_ttl: self.lease_ttl,
+            high_watermark: self.high_watermark,
+            eviction_ratio: self.eviction_ratio,
+            segment_ttl: self.segment_ttl,
+            next_replica_id: self.next_replica_id,
+            segments: self
+                .allocators
+                .iter()
+                .map(|a| SegmentSnapshot {
+                    name: a.segment_name().to_string(),
+                    capacity: a.capacity(),
+                })
+                .collect(),
+            objects: self
+                .objects
+                .iter()
+                .map(|(key, o)| ObjectSnapshot {
+                    key: key.clone(),
+                    replicas: o.replicas.values().cloned().collect(),
+                    identity: o.identity.clone(),
+                    lease_until: o.lease_until,
+                    last_access: o.last_access,
+                    soft_pinned: o.soft_pinned,
+                    hard_pinned: o.hard_pinned,
+                })
+                .collect(),
+        }
+    }
+
+    /// Rebuild a master from a snapshot: re-mount the segments and re-reserve each
+    /// replica's exact `(offset, size)` so the allocator layout matches, then
+    /// restore objects, leases, pins, and the clock.
+    pub fn recover(snapshot: MasterSnapshot) -> Result<Self, ErrorCode> {
+        let mut master = MasterService::new(&snapshot.strategy);
+        master.clock = snapshot.clock;
+        master.lease_ttl = snapshot.lease_ttl;
+        master.high_watermark = snapshot.high_watermark;
+        master.eviction_ratio = snapshot.eviction_ratio;
+        master.segment_ttl = snapshot.segment_ttl;
+        for seg in &snapshot.segments {
+            master.mount_segment(seg.name.clone(), seg.capacity);
+        }
+        for obj in snapshot.objects {
+            // Re-reserve each Memory replica's exact range so the allocator's
+            // free-list reflects the recovered layout (Disk replicas are durable).
+            for replica in &obj.replicas {
+                if let ReplicaData::Memory(buf) = &replica.data {
+                    let allocator = master
+                        .allocators
+                        .iter_mut()
+                        .find(|a| a.segment_name() == buf.segment_name())
+                        .ok_or(ErrorCode::SegmentNotFound)?;
+                    if !allocator.reserve(buf.offset, buf.size) {
+                        return Err(ErrorCode::InvalidReplica);
+                    }
+                }
+            }
+            let mut replicas = ReplicaList::new();
+            for replica in obj.replicas {
+                replicas.insert(replica.id, replica);
+            }
+            master.objects.insert(
+                obj.key,
+                ObjectMetadata {
+                    replicas,
+                    identity: obj.identity,
+                    lease_until: obj.lease_until,
+                    last_access: obj.last_access,
+                    soft_pinned: obj.soft_pinned,
+                    hard_pinned: obj.hard_pinned,
+                },
+            );
+        }
+        master.next_replica_id = snapshot.next_replica_id;
+        Ok(master)
+    }
+
+    /// Persist a snapshot to `path` **atomically** — write a temp file, then
+    /// rename — so a crash mid-write never leaves a torn snapshot (the QuillCache
+    /// crash-consistency discipline applied to the master's metadata).
+    pub fn save_snapshot(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        let path = path.as_ref();
+        let bytes = serde_json::to_vec(&self.snapshot())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let tmp = path.with_extension("snapshot.tmp");
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Recover a master from a snapshot file written by [`MasterService::save_snapshot`].
+    pub fn load_snapshot(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        let bytes = std::fs::read(path)?;
+        let snapshot: MasterSnapshot = serde_json::from_slice(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Self::recover(snapshot)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")))
     }
 
     // ---- internals ----
@@ -487,5 +700,87 @@ mod tests {
         }
         assert!(m.remove("A", false).is_ok());
         assert!(!m.exist_key("A"));
+    }
+
+    #[test]
+    fn snapshot_recovers_objects_segments_and_allocator_state() {
+        let mut m = MasterService::new("random");
+        m.mount_segment("seg-0", 1000);
+        m.mount_segment("seg-1", 1000);
+        let id = scope("ten-a");
+        m.put_start("a".into(), id.clone(), 64, &ReplicateConfig::replicas(2))
+            .unwrap();
+        m.put_end("a").unwrap();
+        m.put_start("b".into(), id.clone(), 128, &ReplicateConfig::replicas(1))
+            .unwrap();
+        m.put_end("b").unwrap();
+        let allocated_before = m.allocated();
+
+        // Round-trip through a snapshot (e.g. a restart / leader failover).
+        let mut r = MasterService::recover(m.snapshot()).expect("recover");
+        assert_eq!(r.object_count(), 2);
+        assert_eq!(r.segment_count(), 2);
+        assert_eq!(
+            r.allocated(),
+            allocated_before,
+            "the allocator's allocated bytes are rebuilt exactly"
+        );
+
+        // Recovered objects are readable, still identity-guarded.
+        assert_eq!(r.get_replica_list("a", &id).unwrap().len(), 2);
+        assert!(matches!(
+            r.get_replica_list("a", &scope("ten-b")),
+            Err(ErrorCode::UnsafeReuse(_))
+        ));
+
+        // The rebuilt allocator won't hand out the recovered ranges again: a fresh
+        // Put succeeds without overlapping the reserved offsets.
+        r.put_start("c".into(), id.clone(), 64, &ReplicateConfig::replicas(1))
+            .unwrap();
+        r.put_end("c").unwrap();
+        assert!(r.get_replica_list("c", &id).is_ok());
+    }
+
+    #[test]
+    fn snapshot_file_round_trip_is_atomic() {
+        let mut m = MasterService::new("random");
+        m.mount_segment("seg-0", 1000);
+        let id = scope("ten-a");
+        m.put_start("k".into(), id.clone(), 64, &ReplicateConfig::replicas(1))
+            .unwrap();
+        m.put_end("k").unwrap();
+
+        let path = std::env::temp_dir().join(format!("qc-master-snap-{}.json", std::process::id()));
+        m.save_snapshot(&path).unwrap();
+        let mut r = MasterService::load_snapshot(&path).unwrap();
+        assert_eq!(r.get_replica_list("k", &id).unwrap().len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn heartbeat_health_hides_replicas_on_a_dead_segment() {
+        let mut m = MasterService::new("random");
+        m.set_segment_ttl(5); // enable failure detection
+        m.mount_segment("seg-0", 1000);
+        let id = scope("ten-a");
+        m.put_start("k".into(), id.clone(), 64, &ReplicateConfig::replicas(1))
+            .unwrap();
+        m.put_end("k").unwrap();
+        assert!(m.segment_alive("seg-0"));
+        assert!(m.get_replica_list("k", &id).is_ok());
+
+        // Miss heartbeats past the TTL → the segment is dead and its only replica
+        // is treated as lost, so the object becomes unservable.
+        for _ in 0..6 {
+            m.tick();
+        }
+        assert!(!m.segment_alive("seg-0"));
+        assert_eq!(m.dead_segments(), vec!["seg-0".to_string()]);
+        assert_eq!(m.get_replica_list("k", &id), Err(ErrorCode::ObjectNotReady));
+
+        // A heartbeat brings the node back and its replica is served again.
+        m.heartbeat("seg-0").unwrap();
+        assert!(m.segment_alive("seg-0"));
+        assert!(m.get_replica_list("k", &id).is_ok());
     }
 }

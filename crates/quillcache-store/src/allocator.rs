@@ -37,6 +37,10 @@ pub trait BufferAllocator: std::fmt::Debug + Send + Sync {
     fn deallocate(&mut self, buffer: &AllocatedBuffer);
     /// The largest single contiguous free region (the biggest allocatable size).
     fn largest_free_region(&self) -> u64;
+    /// Reserve an exact `(offset, size)` range whose layout is already known —
+    /// used to rebuild allocator state from a snapshot on master recovery.
+    /// Returns false if the range is not entirely free.
+    fn reserve(&mut self, offset: u64, size: u64) -> bool;
 }
 
 /// First-fit offset allocator over a sorted free-list of `offset -> length`
@@ -126,6 +130,33 @@ impl BufferAllocator for OffsetBufferAllocator {
 
     fn largest_free_region(&self) -> u64 {
         self.free.values().copied().max().unwrap_or(0)
+    }
+
+    fn reserve(&mut self, offset: u64, size: u64) -> bool {
+        if size == 0 {
+            return false;
+        }
+        let end = offset + size;
+        // The free region containing [offset, end): the one starting at or before
+        // `offset` whose extent covers `end`.
+        let containing = self
+            .free
+            .range(..=offset)
+            .next_back()
+            .map(|(&o, &l)| (o, l));
+        let (r_off, r_len) = match containing {
+            Some((o, l)) if o + l >= end => (o, l),
+            _ => return false,
+        };
+        self.free.remove(&r_off);
+        if offset > r_off {
+            self.free.insert(r_off, offset - r_off); // free remainder before
+        }
+        if r_off + r_len > end {
+            self.free.insert(end, (r_off + r_len) - end); // free remainder after
+        }
+        self.allocated += size;
+        true
     }
 }
 
