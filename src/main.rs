@@ -1,6 +1,7 @@
 mod cluster;
 mod gateway;
 mod pd;
+mod pd_proxy;
 mod store_master_http;
 mod transfer_node;
 
@@ -61,6 +62,20 @@ enum Command {
     /// Disaggregated plan, then the freshly-prefilled KV moves from the prefill
     /// node to the decode node over the transfer engine, identity-guarded.
     Pd,
+    /// Run the P/D proxy: an OpenAI-compatible front that orchestrates
+    /// prefill → store → decode across two engines sharing a QuillCache store
+    /// (puts the store on the request hot path). The prefill engine offloads the
+    /// prefix KV; the decode engine reuses it from the store.
+    PdProxy {
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        bind: String,
+        /// Base URL of the prefill engine (its connector offloads KV).
+        #[arg(long)]
+        prefill: String,
+        /// Base URL of the decode engine (its connector loads KV).
+        #[arg(long)]
+        decode: String,
+    },
     /// Run the store's MasterService over HTTP (Mooncake's master service): the
     /// two-phase Put, identity-guarded Get, Mount, Remove, for out-of-process
     /// engine KV connectors. Object bytes still move via the transfer engine.
@@ -113,6 +128,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Plan => print_plan(),
         Command::Cluster { nodes, requests } => cluster::run_cluster(nodes, requests).await?,
         Command::Pd => pd::run_pd_demo().await?,
+        Command::PdProxy {
+            bind,
+            prefill,
+            decode,
+        } => pd_proxy::run_pd_proxy(bind, prefill, decode).await?,
         Command::StoreMaster {
             addr,
             strategy,

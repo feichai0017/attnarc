@@ -146,13 +146,19 @@ def run_pd():
         wait_ready("http://127.0.0.1:8000/health", 900, "vllm-prefill", procs["vllm-8000"][0])
         wait_ready("http://127.0.0.1:8001/health", 900, "vllm-decode", procs["vllm-8001"][0])
 
-        # 3) prefill the prompt on GPU 0 → its KV is published to the store.
-        t_prefill, out_p = chat(8000)
-        time.sleep(2.0)  # let the manifest commit settle
-        # 4) same prompt to the DECODE instance on GPU 1 → it loads prefill's KV
-        #    from the store instead of prefilling.
-        t_decode, out_d = chat(8001)
-        time.sleep(1.0)
+        # 3) the P/D proxy fronts both engines: ONE request to it orchestrates
+        #    prefill (GPU 0, warms the store) → decode (GPU 1, reuses from the store).
+        spawn(
+            "pd-proxy",
+            ["quillcache", "pd-proxy", "--bind", "127.0.0.1:9000",
+             "--prefill", "http://127.0.0.1:8000", "--decode", "http://127.0.0.1:8001"],
+            "/tmp/proxy.log",
+        )
+        wait_ready("http://127.0.0.1:9000/v1/state", 30, "pd-proxy", procs["pd-proxy"][0])
+
+        # 4) a single request THROUGH the proxy drives the whole P/D flow.
+        t_proxy, out_text = chat(9000)
+        time.sleep(1.5)  # let the manifest commit + decode load settle
 
         prefill_log = open("/tmp/vllm_prefill.log", errors="replace").read()
         decode_log = open("/tmp/vllm_decode.log", errors="replace").read()
@@ -167,13 +173,15 @@ def run_pd():
 
         result = {
             "ok": True,
-            "prefill_ms": round(t_prefill),
-            "decode_ms": round(t_decode),
-            "outputs_match": out_p == out_d,
+            "proxy_ms": round(t_proxy),
+            "output": out_text,
             "prefill_committed": prefill_committed[:3],
             "decode_manifest_hit": decode_hit[:3],
             "decode_loaded": decode_loaded[:3],
             "store_state": state,
+            "proxy_log_tail": "\n".join(
+                open("/tmp/proxy.log", errors="replace").read().splitlines()[-12:]
+            ),
             "decode_log_tail": "\n".join(decode_log.splitlines()[-30:]),
         }
     except Exception as e:
@@ -208,8 +216,7 @@ def main():
         print("\n--- decode log tail ---\n" + res.get("decode_log_tail", ""))
         print("\n--- master log tail ---\n" + res.get("master_log_tail", ""))
         return
-    print(f"\nlatency: prefill(GPU0)={res['prefill_ms']}ms  decode(GPU1)={res['decode_ms']}ms")
-    print(f"outputs identical: {res['outputs_match']}")
+    print(f"\none request THROUGH the P/D proxy: {res['proxy_ms']}ms → {res['output']!r}")
     print("\n[prefill GPU0 committed KV to the store]")
     for l in res["prefill_committed"]:
         print("   ", l.strip()[:150])
@@ -223,7 +230,8 @@ def main():
     print(json.dumps(res["store_state"], indent=2)[:600])
     cross = bool(res["prefill_committed"]) and bool(res["decode_manifest_hit"]) and bool(res["decode_loaded"])
     print(
-        f"\nVERDICT: {'REAL cross-instance P/D — GPU0 prefill KV reused by GPU1 decode via the store' if cross else 'partial — see decode_log_tail'}"
+        f"\nVERDICT: {'REAL end-to-end P/D THROUGH THE PROXY — one request → prefill(GPU0) warmed the store → decode(GPU1) reused it' if cross else 'partial — see logs'}"
     )
     if not cross:
+        print("\n--- proxy log tail ---\n" + res.get("proxy_log_tail", ""))
         print("\n--- decode log tail ---\n" + res["decode_log_tail"])
