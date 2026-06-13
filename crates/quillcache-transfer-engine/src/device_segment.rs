@@ -178,8 +178,9 @@ impl DeviceSegment {
             .map_err(|e| format!("bind ctx: {e:?}"))?;
         let res = unsafe { sys::cuCtxEnablePeerAccess(peer.ctx.cu_ctx(), 0) };
         match res {
-            sys::CUresult::CUDA_SUCCESS
-            | sys::CUresult::CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED => Ok(()),
+            sys::CUresult::CUDA_SUCCESS | sys::CUresult::CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED => {
+                Ok(())
+            }
             other => Err(format!("cuCtxEnablePeerAccess: {other:?}")),
         }
     }
@@ -197,8 +198,12 @@ impl DeviceSegment {
         if std::ptr::eq(self, dst) {
             return Err("peer copy to self is not supported".into());
         }
-        let src_end = src_offset.checked_add(len).ok_or("src offset+len overflow")?;
-        let dst_end = dst_offset.checked_add(len).ok_or("dst offset+len overflow")?;
+        let src_end = src_offset
+            .checked_add(len)
+            .ok_or("src offset+len overflow")?;
+        let dst_end = dst_offset
+            .checked_add(len)
+            .ok_or("dst offset+len overflow")?;
         if dst_end > dst.capacity {
             return Err(format!(
                 "peer copy exceeds dst HBM capacity ({dst_end} > {})",

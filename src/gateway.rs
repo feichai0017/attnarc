@@ -183,12 +183,43 @@ impl SloGoodput {
     }
 }
 
+/// Cumulative routing counters for the Prometheus `/metrics` endpoint. Raw
+/// counters (rates are computed at query time, the Prometheus convention); fed
+/// from each request's [`GatewayRouteTrace`] so the cache effectiveness + the
+/// identity guard are observable as fleet-wide totals, not just per-request headers.
+#[derive(Debug, Default)]
+struct GatewayMetrics {
+    requests_total: AtomicU64,
+    reusable_blocks_total: AtomicU64,
+    local_hits_total: AtomicU64,
+    transfer_blocks_total: AtomicU64,
+    recompute_blocks_total: AtomicU64,
+    reuse_refused_total: AtomicU64,
+}
+
+impl GatewayMetrics {
+    fn record(&self, t: &GatewayRouteTrace) {
+        self.requests_total.fetch_add(1, Ordering::Relaxed);
+        self.reusable_blocks_total
+            .fetch_add(t.reusable_blocks as u64, Ordering::Relaxed);
+        self.local_hits_total
+            .fetch_add(t.local_hits as u64, Ordering::Relaxed);
+        self.transfer_blocks_total
+            .fetch_add(t.transfer_blocks as u64, Ordering::Relaxed);
+        self.recompute_blocks_total
+            .fetch_add(t.recompute_blocks as u64, Ordering::Relaxed);
+        self.reuse_refused_total
+            .fetch_add(t.reuse_refused as u64, Ordering::Relaxed);
+    }
+}
+
 #[derive(Debug, Clone)]
 struct GatewayState {
     control: Arc<RwLock<ControlPlane>>,
     client: Client,
     action_sink: Option<ActionSink>,
     slo: Arc<SloGoodput>,
+    metrics: Arc<GatewayMetrics>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -380,6 +411,7 @@ pub async fn run(config: GatewayConfig) -> Result<(), GatewayError> {
         client: Client::new(),
         action_sink,
         slo: Arc::new(SloGoodput::default()),
+        metrics: Arc::new(GatewayMetrics::default()),
     };
     let control = state.control.clone();
     let app = router(state);
@@ -546,6 +578,7 @@ fn router(state: GatewayState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/state", get(state_snapshot))
+        .route("/metrics", get(metrics_endpoint))
         .route("/v1/kv-events", post(ingest_kv_events))
         .route("/v1/chat/completions", post(proxy_chat_completions))
         .route("/v1/completions", post(proxy_completions))
@@ -554,6 +587,66 @@ fn router(state: GatewayState) -> Router {
 
 async fn healthz() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
+}
+
+/// Prometheus-text metrics: cache effectiveness (local hits / transfers /
+/// recomputes / reusable), the identity guard (refused reuse), SLO goodput, and
+/// resident-block occupancy — the observability the production gap analysis flagged.
+async fn metrics_endpoint(State(state): State<GatewayState>) -> impl IntoResponse {
+    let m = &state.metrics;
+    let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
+    let resident = { state.control.read().await.residency().len() };
+    let body = format!(
+        concat!(
+            "# HELP quillcache_requests_total Requests routed by the gateway.\n",
+            "# TYPE quillcache_requests_total counter\n",
+            "quillcache_requests_total {req}\n",
+            "# HELP quillcache_local_hits_total KV blocks served from a worker's local HBM.\n",
+            "# TYPE quillcache_local_hits_total counter\n",
+            "quillcache_local_hits_total {lh}\n",
+            "# HELP quillcache_transfer_blocks_total KV blocks fetched from the store / another worker.\n",
+            "# TYPE quillcache_transfer_blocks_total counter\n",
+            "quillcache_transfer_blocks_total {tb}\n",
+            "# HELP quillcache_recompute_blocks_total KV blocks recomputed on a cache miss.\n",
+            "# TYPE quillcache_recompute_blocks_total counter\n",
+            "quillcache_recompute_blocks_total {rb}\n",
+            "# HELP quillcache_reusable_blocks_total Reusable prefix blocks the planner found.\n",
+            "# TYPE quillcache_reusable_blocks_total counter\n",
+            "quillcache_reusable_blocks_total {rub}\n",
+            "# HELP quillcache_reuse_refused_total Content-matching blocks the identity guard refused.\n",
+            "# TYPE quillcache_reuse_refused_total counter\n",
+            "quillcache_reuse_refused_total {rr}\n",
+            "# HELP quillcache_slo_served_total Streamed responses measured for SLO goodput.\n",
+            "# TYPE quillcache_slo_served_total counter\n",
+            "quillcache_slo_served_total {srv}\n",
+            "# HELP quillcache_slo_met_total Responses whose first token met the TTFT budget.\n",
+            "# TYPE quillcache_slo_met_total counter\n",
+            "quillcache_slo_met_total {met}\n",
+            "# HELP quillcache_slo_ttft_ms_sum Sum of measured TTFT in milliseconds.\n",
+            "# TYPE quillcache_slo_ttft_ms_sum counter\n",
+            "quillcache_slo_ttft_ms_sum {ttft}\n",
+            "# HELP quillcache_resident_blocks Current resident KV blocks in the index.\n",
+            "# TYPE quillcache_resident_blocks gauge\n",
+            "quillcache_resident_blocks {res}\n",
+        ),
+        req = g(&m.requests_total),
+        lh = g(&m.local_hits_total),
+        tb = g(&m.transfer_blocks_total),
+        rb = g(&m.recompute_blocks_total),
+        rub = g(&m.reusable_blocks_total),
+        rr = g(&m.reuse_refused_total),
+        srv = g(&state.slo.served),
+        met = g(&state.slo.met),
+        ttft = g(&state.slo.ttft_ms_sum),
+        res = resident,
+    );
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
 }
 
 async fn state_snapshot(State(state): State<GatewayState>) -> impl IntoResponse {
@@ -641,6 +734,8 @@ async fn proxy_openai_path(
         let action_plan = ActionSinkPlan::from(&plan);
         (engine, trace, action_plan)
     };
+
+    state.metrics.record(&trace);
 
     if trace.reuse_refused > 0 {
         tracing::warn!(
@@ -1157,6 +1252,35 @@ mod tests {
         assert_eq!(event.phase, ActionSinkPhase::Planned);
         assert_eq!(event.request.id, "req-a");
         assert_eq!(event.route.engine_id, "vllm-a");
+    }
+
+    #[test]
+    fn metrics_aggregate_route_traces_into_totals() {
+        let mk = |local, transfer, recompute, refused, reusable| GatewayRouteTrace {
+            request_id: "r".to_string(),
+            mode: ServingMode::Aggregated,
+            engine_id: "e".to_string(),
+            prefill_engine_id: None,
+            decode_engine_id: "e".to_string(),
+            planner_actions: 0,
+            reusable_blocks: reusable,
+            local_hits: local,
+            transfer_blocks: transfer,
+            recompute_blocks: recompute,
+            reuse_refused: refused,
+            estimated_ttft_us: 0,
+            estimated_tpot_us: 0,
+        };
+        let m = GatewayMetrics::default();
+        m.record(&mk(3, 1, 2, 1, 4));
+        m.record(&mk(2, 0, 1, 0, 2));
+        let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        assert_eq!(g(&m.requests_total), 2);
+        assert_eq!(g(&m.local_hits_total), 5);
+        assert_eq!(g(&m.transfer_blocks_total), 1);
+        assert_eq!(g(&m.recompute_blocks_total), 3);
+        assert_eq!(g(&m.reuse_refused_total), 1);
+        assert_eq!(g(&m.reusable_blocks_total), 6);
     }
 
     #[test]
