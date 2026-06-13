@@ -33,17 +33,22 @@ how far each piece is integrated:
 - **✅ wired online & measured** — the gateway, control plane, Dynamo-cost
   routing, persistent residency index, `StoreDataPlane` moving real bytes across
   HBM/DRAM/SSD, live SLO goodput, and the ART-vs-LSM storage study.
-- **▣ tested unit (not yet on the live gateway path)** — the faithful store: a
-  `Client` Put→Get over the transfer engine (real TCP), the `MasterService`
-  two-phase Put + lease eviction, the identity guard, and `DiskTier` crash
-  recovery. All covered by tests (and the `cluster` demo); wiring them into the
-  live gateway needs an engine KV-connector for the engine⟷store byte handoff.
-- **⊙ reserved / needs hardware** — `RdmaTransport` (behind the `rdma` feature),
-  the etcd metadata backend, and the CUDA device tier (build `quillcache-cuda`
-  with `--features cuda` on a GPU box). All real interfaces, stubbed so the
-  default build is hardware-free.
+- **◑ GPU-verified on Modal (the engine ⟷ store path)** — a real vLLM 0.22.1
+  `KVConnectorBase_V1` (`bridge/quillcache_v1_connector.py`) offloads a prompt's KV
+  to the store and **reuses** it on a later request (L4); **disaggregated
+  prefill/decode** runs across two engines sharing one store via `quillcache
+  pd-proxy` — both content-addressed reuse *and* true vLLM-native P/D
+  (`kv_producer`/`kv_consumer` with a `transfer_id` handshake, output matching a
+  monolithic run token-for-token) on 2×L4. This exercises the faithful store
+  (`Client` two-phase Put, `MasterService` + identity guard, transfer engine) and
+  master **HA** (etcd leader election, verified vs Docker etcd) end to end.
+- **⊙ reserved / needs hardware** — `RdmaTransport` / GPUDirect zero-copy (behind
+  the `rdma` / `nvlink` features): real interfaces, stubbed so the default build
+  stays hardware-free. (The CUDA device tier is also GPU-verified —
+  `quillcache-cuda --features cuda` on an L4 — but stays out of the default
+  workspace.)
 
-`cargo test` — 60 tests pass; `cargo fmt --check` and `cargo clippy` are clean.
+`cargo test` — 79 tests pass; `cargo fmt --check` and `cargo clippy` are clean.
 
 ## Differentiation
 

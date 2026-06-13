@@ -12,7 +12,7 @@ C++ toolchain.
 git clone https://github.com/feichai0017/quillcache
 cd quillcache
 cargo build
-cargo test          # 60 tests
+cargo test          # 79 tests
 ```
 
 ## The cluster demo — the Mooncake-faithful store

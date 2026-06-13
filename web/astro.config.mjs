@@ -4,9 +4,40 @@ import starlight from "@astrojs/starlight";
 
 // QuillCache docs site — Astro + Starlight, Claude-themed.
 // Deployed to GitHub Pages at https://feichai0017.github.io/quillcache/
+const SITE_BASE = "/quillcache";
+
+// Astro/Starlight base-prefixes the *sidebar* but NOT root-absolute links written
+// in markdown/MDX prose (`[x](/storage-study/)`), so those 404 under a project
+// base. This rehype plugin rewrites every root-absolute internal <a href> to
+// include the base, once, centrally — so prose links can stay base-agnostic.
+function rehypeBaseUrl() {
+  const walk = (node) => {
+    if (
+      node.tagName === "a" &&
+      node.properties &&
+      typeof node.properties.href === "string"
+    ) {
+      const href = node.properties.href;
+      if (
+        href.startsWith("/") &&
+        !href.startsWith("//") &&
+        !href.startsWith(`${SITE_BASE}/`) &&
+        href !== SITE_BASE
+      ) {
+        node.properties.href = SITE_BASE + href;
+      }
+    }
+    if (Array.isArray(node.children)) node.children.forEach(walk);
+  };
+  return (tree) => walk(tree);
+}
+
 export default defineConfig({
   site: "https://feichai0017.github.io",
-  base: "/quillcache",
+  base: SITE_BASE,
+  markdown: {
+    rehypePlugins: [rehypeBaseUrl],
+  },
   integrations: [
     starlight({
       title: "QuillCache",
