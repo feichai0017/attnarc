@@ -18,7 +18,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
+use cudarc::driver::{sys, CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -142,6 +142,95 @@ impl DeviceSegment {
         }
         Ok(())
     }
+
+    // ==============================
+    // Zero-copy GPU↔GPU peer transfer (intra-node NVLink / PCIe P2P)
+    //
+    // The READ/WRITE path above stages every byte through host RAM (D2H to serve,
+    // H2D to apply) — the exact hop GPUDirect-RDMA removes across nodes. *Within*
+    // a node, CUDA peer copy (`cuMemcpyPeer`) removes the same hop: HBM→HBM
+    // directly over NVLink/PCIe, no host bounce. This is the no-NIC equivalent of
+    // Mooncake's zero-copy data path, and is the real, multi-GPU-verifiable core
+    // of the `nvlink` transport.
+    // ==============================
+
+    /// Can this segment's GPU directly reach `peer`'s HBM (NVLink / PCIe P2P)?
+    /// When false, [`Self::copy_to_peer`] still works — the driver stages through
+    /// host internally — it just isn't the zero-copy fast path.
+    pub fn can_access_peer(&self, peer: &DeviceSegment) -> Result<bool, String> {
+        let mut can: std::ffi::c_int = 0;
+        let res = unsafe {
+            sys::cuDeviceCanAccessPeer(&mut can, self.ctx.cu_device(), peer.ctx.cu_device())
+        };
+        if res != sys::CUresult::CUDA_SUCCESS {
+            return Err(format!("cuDeviceCanAccessPeer: {res:?}"));
+        }
+        Ok(can != 0)
+    }
+
+    /// Grant this segment's context direct access to `peer`'s HBM, so a later
+    /// [`Self::copy_to_peer`] is true HBM→HBM P2P instead of host-staged.
+    /// `cuCtxEnablePeerAccess` acts on the *current* context, so we bind ours
+    /// first. Idempotent: an already-enabled link is treated as success.
+    pub fn enable_peer_access(&self, peer: &DeviceSegment) -> Result<(), String> {
+        self.ctx
+            .bind_to_thread()
+            .map_err(|e| format!("bind ctx: {e:?}"))?;
+        let res = unsafe { sys::cuCtxEnablePeerAccess(peer.ctx.cu_ctx(), 0) };
+        match res {
+            sys::CUresult::CUDA_SUCCESS
+            | sys::CUresult::CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED => Ok(()),
+            other => Err(format!("cuCtxEnablePeerAccess: {other:?}")),
+        }
+    }
+
+    /// Zero-copy device-to-device copy: `len` bytes from this segment at
+    /// `src_offset` into `dst` at `dst_offset`, HBM→HBM with no host staging.
+    /// Grows `dst`'s logical length. Errors out of bounds / over capacity.
+    pub fn copy_to_peer(
+        &self,
+        src_offset: usize,
+        dst: &DeviceSegment,
+        dst_offset: usize,
+        len: usize,
+    ) -> Result<(), String> {
+        if std::ptr::eq(self, dst) {
+            return Err("peer copy to self is not supported".into());
+        }
+        let src_end = src_offset.checked_add(len).ok_or("src offset+len overflow")?;
+        let dst_end = dst_offset.checked_add(len).ok_or("dst offset+len overflow")?;
+        if dst_end > dst.capacity {
+            return Err(format!(
+                "peer copy exceeds dst HBM capacity ({dst_end} > {})",
+                dst.capacity
+            ));
+        }
+        // Distinct segments (distinct GPUs), guarded above, so locking src then
+        // dst can't self-deadlock; a production path would order locks by address.
+        let src_a = self.arena.lock().unwrap();
+        if src_end > src_a.len {
+            return Err("peer copy src out of segment bounds".into());
+        }
+        let mut dst_a = dst.arena.lock().unwrap();
+        if len > 0 {
+            let src_view = src_a.hbm.slice(src_offset..src_end);
+            let mut dst_view = dst_a.hbm.slice_mut(dst_offset..dst_end);
+            let (src_ptr, _src_sync) = src_view.device_ptr(&self.stream);
+            let (dst_ptr, _dst_sync) = dst_view.device_ptr_mut(&dst.stream);
+            // Synchronous wrt both contexts; the SyncOnDrop guards keep the slices
+            // alive across the call.
+            let res = unsafe {
+                sys::cuMemcpyPeer(dst_ptr, dst.ctx.cu_ctx(), src_ptr, self.ctx.cu_ctx(), len)
+            };
+            if res != sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("cuMemcpyPeer: {res:?}"));
+            }
+        }
+        if dst_end > dst_a.len {
+            dst_a.len = dst_end;
+        }
+        Ok(())
+    }
 }
 
 /// Serve a GPU HBM [`DeviceSegment`] to peers over the same one-sided
@@ -225,5 +314,69 @@ mod tests {
             .await
             .expect("read HBM 2");
         assert_eq!(&got2[..], b"written-into-HBM");
+    }
+
+    // Needs TWO NVIDIA GPUs. Zero-copy HBM→HBM peer copy: bytes registered on
+    // GPU 0's segment land in GPU 1's segment with no host staging, and read back
+    // identically. Run on a 2-GPU box:
+    // `cargo test -p quillcache-transfer-engine --features cuda -- --ignored`.
+    #[test]
+    #[ignore = "requires two NVIDIA GPUs"]
+    fn peer_copy_moves_bytes_gpu0_to_gpu1() {
+        let src = DeviceSegment::new(0, 1 << 20).expect("alloc HBM segment on GPU 0");
+        let dst = DeviceSegment::new(1, 1 << 20).expect("alloc HBM segment on GPU 1");
+        let payload = b"zero-copy-across-GPUs";
+        let off = src.register(payload).expect("register on GPU 0");
+
+        // Best-effort enable the P2P fast path; the copy is correct either way.
+        if src.can_access_peer(&dst).unwrap_or(false) {
+            src.enable_peer_access(&dst).expect("enable peer access");
+        }
+        src.copy_to_peer(off as usize, &dst, 0, payload.len())
+            .expect("HBM→HBM peer copy");
+
+        // Read it back off GPU 1 (D2H) — the bytes crossed GPU0→GPU1 directly.
+        let got = dst.read(0, payload.len()).expect("read GPU 1 segment");
+        assert_eq!(&got[..], payload);
+    }
+
+    // Needs TWO NVIDIA GPUs (ideally NVLink-connected). Measures the zero-copy
+    // win: HBM→HBM peer copy vs the host-staged path (D2H then H2D) for the same
+    // bytes. Prints a `QC-P2P ...` line with both bandwidths + the speedup.
+    #[test]
+    #[ignore = "requires two NVIDIA GPUs"]
+    fn peer_copy_bandwidth_vs_host_staged() {
+        use std::time::Instant;
+        let bytes = 256 * 1024 * 1024; // 256 MiB
+        let src = DeviceSegment::new(0, bytes).expect("src segment GPU 0");
+        let dst = DeviceSegment::new(1, bytes).expect("dst segment GPU 1");
+        src.register(&vec![7u8; bytes]).expect("fill src HBM");
+
+        let p2p = src.can_access_peer(&dst).unwrap_or(false);
+        if p2p {
+            src.enable_peer_access(&dst).expect("enable peer access");
+        }
+
+        let iters = 10;
+        src.copy_to_peer(0, &dst, 0, bytes).expect("warm peer copy"); // warm up
+        let t = Instant::now();
+        for _ in 0..iters {
+            src.copy_to_peer(0, &dst, 0, bytes).expect("peer copy");
+        }
+        let peer_gbs = (bytes as f64 * iters as f64) / t.elapsed().as_secs_f64() / 1e9;
+
+        // The host-bounced path: D2H off GPU 0, then H2D onto GPU 1.
+        let t = Instant::now();
+        for _ in 0..iters {
+            let host = src.read(0, bytes).expect("d2h");
+            dst.write(0, &host).expect("h2d");
+        }
+        let staged_gbs = (bytes as f64 * iters as f64) / t.elapsed().as_secs_f64() / 1e9;
+
+        eprintln!(
+            "QC-P2P p2p_enabled={p2p} peer={peer_gbs:.1}GB/s staged={staged_gbs:.1}GB/s speedup={:.2}x",
+            peer_gbs / staged_gbs.max(f64::MIN_POSITIVE)
+        );
+        assert!(peer_gbs > 0.0, "peer-copy bandwidth must be positive");
     }
 }
