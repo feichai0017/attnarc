@@ -91,8 +91,8 @@ how far each piece is integrated:
 - **▣ tested unit (not yet on the live gateway path)** — the faithful store: a
   `Client` Put→Get over the transfer engine (real TCP), the `MasterService`
   two-phase Put + lease eviction, the identity guard, and `DiskTier` crash
-  recovery. All covered by tests (and the `cluster` demo); wiring them into the
-  live gateway needs an engine KV-connector for the engine⟷store byte handoff.
+  recovery. All covered by tests (and the `cluster` + `pd` demos); the engine⟷store
+  byte handoff is the vLLM KV connector below (GPU-verified).
 - **◑ real, behind a feature / needs infra to run** — the `EtcdMetadata` backend
   (behind `etcd` — real etcd-client code + a background-watch-synced cache,
   compile-checked in CI and **verified against a real etcd in Docker**: two
@@ -109,6 +109,13 @@ how far each piece is integrated:
   an *unmodified* TCP peer reads/writes GPU-resident bytes). Both **verified on a
   Modal NVIDIA L4** (`deploy/modal_cuda_verify.py`); cudarc `dynamic-loading` means
   they compile with no CUDA toolkit (CI compile-checks both), GPU tests `#[ignore]`.
+- **◑ real, verified on a GPU (Modal L4)** — the vLLM 0.22.1 KV connector
+  (`bridge/quillcache_v1_connector.py`, a real `KVConnectorBase_V1`): a prompt's KV
+  is offloaded to the store and **reused** on a later request
+  (`deploy/modal_vllm_connector.py`), and — **disaggregated** — prefill on GPU 0 →
+  store → decode on GPU 1, KV computed on one instance reused by another over the
+  transfer engine (`deploy/modal_vllm_pd.py`). The store is the same identity-guarded
+  `MasterService`; the local (no-GPU) form is `cargo run -- pd`.
 - **⊙ reserved / needs hardware** — `RdmaTransport` / `NvlinkTransport` (behind
   `rdma` / `nvlink`): GPUDirect-RDMA / NVLink *zero-copy* needs a NIC / multi-GPU.
   Real interfaces, stubbed so the default build stays hardware-free.
