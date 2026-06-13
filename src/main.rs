@@ -1,5 +1,6 @@
 mod cluster;
 mod gateway;
+mod pd;
 mod store_master_http;
 mod transfer_node;
 
@@ -56,6 +57,10 @@ enum Command {
         #[arg(long, default_value_t = 12)]
         requests: usize,
     },
+    /// Run the disaggregated prefill/decode demo: the control plane emits a
+    /// Disaggregated plan, then the freshly-prefilled KV moves from the prefill
+    /// node to the decode node over the transfer engine, identity-guarded.
+    Pd,
     /// Run the store's MasterService over HTTP (Mooncake's master service): the
     /// two-phase Put, identity-guarded Get, Mount, Remove, for out-of-process
     /// engine KV connectors. Object bytes still move via the transfer engine.
@@ -90,6 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Gateway { config } => run_from_config_path(config).await?,
         Command::Plan => print_plan(),
         Command::Cluster { nodes, requests } => cluster::run_cluster(nodes, requests).await?,
+        Command::Pd => pd::run_pd_demo().await?,
         Command::StoreMaster { addr, strategy } => {
             store_master_http::run_store_master(addr, strategy).await?
         }

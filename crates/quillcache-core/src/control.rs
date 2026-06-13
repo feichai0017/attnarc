@@ -80,6 +80,43 @@ pub struct RequestPlan {
     pub actions: Vec<PlanAction>,
 }
 
+/// The prefill → decode KV handoff a disaggregated plan implies (Mooncake's P/D
+/// data path): the freshly-prefilled blocks the `prefill_worker` computes and
+/// publishes to the store, which the `decode_worker` then reads over the
+/// Transfer Engine before continuing generation. `None` in aggregated mode (the
+/// same worker prefills and decodes, so no KV crosses the wire).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvHandoff {
+    pub request_id: String,
+    pub prefill_worker_id: String,
+    pub decode_worker_id: String,
+    pub blocks: Vec<KvBlockKey>,
+}
+
+impl RequestPlan {
+    /// The disaggregated prefill → decode KV handoff this plan implies, or `None`
+    /// when serving aggregated. The handoff blocks are the plan's `RunPrefill`
+    /// actions — the KV prefill computes that decode must receive.
+    pub fn kv_handoff(&self) -> Option<KvHandoff> {
+        if self.mode != ServingMode::Disaggregated {
+            return None;
+        }
+        let prefill_worker_id = self.prefill_worker_id.clone()?;
+        let blocks = self
+            .actions
+            .iter()
+            .filter(|action| action.kind == PlanActionKind::RunPrefill)
+            .filter_map(|action| action.key.clone())
+            .collect();
+        Some(KvHandoff {
+            request_id: self.route.request_id.clone(),
+            prefill_worker_id,
+            decode_worker_id: self.decode_worker_id.clone(),
+            blocks,
+        })
+    }
+}
+
 /// Translate a batch of engine KV events into residency updates against any
 /// [`IndexBackend`].
 ///
@@ -1141,5 +1178,42 @@ mod tests {
             .actions
             .iter()
             .any(|action| action.kind == PlanActionKind::Decode));
+
+        // The disaggregated plan implies a concrete prefill→decode KV handoff:
+        // the cold block prefill-a computes is what decode-a must receive.
+        let handoff = plan.kv_handoff().expect("disaggregated plan has a handoff");
+        assert_eq!(handoff.request_id, "req-pd");
+        assert_eq!(handoff.prefill_worker_id, "prefill-a");
+        assert_eq!(handoff.decode_worker_id, "decode-a");
+        assert_eq!(handoff.blocks.len(), 1);
+    }
+
+    #[test]
+    fn aggregated_plan_has_no_kv_handoff() {
+        // A single aggregated worker prefills and decodes in place — no KV
+        // crosses the wire, so there is no prefill→decode handoff.
+        let control = ControlPlane::new(vec![engine()]);
+        let request = RequestShape {
+            id: "req-agg".to_string(),
+            model_id: "Qwen/Qwen3-0.6B".to_string(),
+            tokenizer_id: "Qwen/Qwen3-0.6B".to_string(),
+            adapter_id: None,
+            tenant_id: "tenant-a".to_string(),
+            session_id: None,
+            blocks: vec![KvBlockKey::new(
+                "Qwen/Qwen3-0.6B",
+                "Qwen/Qwen3-0.6B",
+                "tenant-a",
+                "root",
+                "cold",
+                0,
+                64,
+            )],
+            estimated_decode_tokens: 16,
+            slo: SloTarget::default(),
+        };
+        let plan = control.plan(&request).unwrap();
+        assert_eq!(plan.mode, ServingMode::Aggregated);
+        assert!(plan.kv_handoff().is_none());
     }
 }

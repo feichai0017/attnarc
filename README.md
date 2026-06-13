@@ -182,6 +182,11 @@ cargo test
 # transfer engine.
 cargo run -- cluster --nodes 4 --requests 12
 
+# Disaggregated prefill/decode demo: the control plane emits a Disaggregated
+# plan, then the freshly-prefilled KV moves prefill-node → decode-node over the
+# transfer engine (identity-guarded). Mooncake's P/D data path, no GPU.
+cargo run -- pd
+
 # The ART-vs-LSM storage study (needs a C++ toolchain for RocksDB).
 cargo run --features "rocksdb holt" -- bench-index --backend holt
 cargo run --features "rocksdb holt" -- bench-index --backend rocksdb
