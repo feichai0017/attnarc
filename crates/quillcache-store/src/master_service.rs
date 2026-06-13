@@ -299,6 +299,60 @@ impl MasterService {
         Ok(complete)
     }
 
+    // ---- batch APIs (Mooncake's BatchPut / BatchGet — one round-trip for many
+    // keys; our connector offloads/loads a prefix's layers as one batch) ----
+
+    /// Allocate replicas for many objects in one call. Transactional: if any key
+    /// can't be allocated, the ones already started in this batch are revoked and
+    /// the error is returned (no partial batch is left behind).
+    pub fn batch_put_start(
+        &mut self,
+        items: Vec<(ObjectKey, IdentityScope, u64)>,
+        config: &ReplicateConfig,
+    ) -> Result<Vec<Vec<AllocatedBuffer>>, ErrorCode> {
+        let mut out = Vec::with_capacity(items.len());
+        let mut started: Vec<ObjectKey> = Vec::new();
+        for (key, identity, size) in items {
+            match self.put_start(key.clone(), identity, size, config) {
+                Ok(buffers) => {
+                    out.push(buffers);
+                    started.push(key);
+                }
+                Err(e) => {
+                    for k in &started {
+                        let _ = self.put_revoke(k);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Commit many objects' replicas (flip to readable). Errors on the first key
+    /// that isn't in flight.
+    pub fn batch_put_end(&mut self, keys: &[String]) -> Result<(), ErrorCode> {
+        for key in keys {
+            self.put_end(key)?;
+        }
+        Ok(())
+    }
+
+    /// Identity-guarded Get for many keys. Errors on the first key that is
+    /// missing / not ready / refused (the connector wants all of a prefix's
+    /// layers, or it recomputes the prefix).
+    pub fn batch_get_replica_list(
+        &mut self,
+        keys: &[String],
+        requester: &IdentityScope,
+    ) -> Result<Vec<Vec<Replica>>, ErrorCode> {
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            out.push(self.get_replica_list(key, requester)?);
+        }
+        Ok(out)
+    }
+
     pub fn exist_key(&self, key: &str) -> bool {
         self.objects
             .get(key)
@@ -782,5 +836,48 @@ mod tests {
         m.heartbeat("seg-0").unwrap();
         assert!(m.segment_alive("seg-0"));
         assert!(m.get_replica_list("k", &id).is_ok());
+    }
+
+    #[test]
+    fn batch_put_then_batch_get_round_trips() {
+        let mut m = MasterService::new("random");
+        m.mount_segment("seg-0", 4096);
+        let id = scope("ten-a");
+        let keys: Vec<String> = vec!["k0".into(), "k1".into(), "k2".into()];
+        let items = keys.iter().map(|k| (k.clone(), id.clone(), 64)).collect();
+
+        let buffers = m
+            .batch_put_start(items, &ReplicateConfig::replicas(1))
+            .unwrap();
+        assert_eq!(buffers.len(), 3);
+        m.batch_put_end(&keys).unwrap();
+
+        let got = m.batch_get_replica_list(&keys, &id).unwrap();
+        assert_eq!(got.len(), 3);
+        assert!(got.iter().all(|replicas| replicas.len() == 1));
+
+        // The identity guard applies to the batch too.
+        assert!(matches!(
+            m.batch_get_replica_list(&["k0".into()], &scope("ten-b")),
+            Err(ErrorCode::UnsafeReuse(_))
+        ));
+    }
+
+    #[test]
+    fn batch_put_start_rolls_back_on_failure() {
+        let mut m = MasterService::new("random");
+        m.mount_segment("seg-0", 100);
+        let id = scope("ten-a");
+        // The second object (200B) can't fit a 100B segment → the batch fails and
+        // the first object's allocation is rolled back (no partial batch).
+        let items = vec![
+            ("a".to_string(), id.clone(), 64),
+            ("b".to_string(), id, 200),
+        ];
+        assert!(m
+            .batch_put_start(items, &ReplicateConfig::replicas(1))
+            .is_err());
+        assert_eq!(m.object_count(), 0);
+        assert_eq!(m.allocated(), 0);
     }
 }
