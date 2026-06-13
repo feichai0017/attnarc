@@ -4,6 +4,11 @@
 //! - **`Client`** ([`DummyClient`] / [`RealClient`]) — the two-phase Put/Get API.
 //! - **`MasterService`** ([`MasterService`]) — object metadata, replica
 //!   allocation, the two-phase Put, lease-based eviction. No bytes flow through it.
+//!   - **HA** (Mooncake's high-availability mode): `snapshot` / `recover` (the
+//!     in-memory metadata snapshot, taken so a restarted or newly-elected master
+//!     rebuilds state), heartbeat-based segment health (failure detection), and
+//!     leader election (`master_election`, `--features etcd`) — multiple masters
+//!     coordinated through etcd, one leader serving, lease-backed failover.
 //! - **`BufferAllocator`** ([`OffsetBufferAllocator`]) + **`AllocationStrategy`**
 //!   ([`RandomAllocationStrategy`] / [`FreeRatioFirstAllocationStrategy`]).
 //! - **`Replica`** ([`Replica`], [`ReplicaData`]) — `Memory` (a mounted segment's
@@ -41,6 +46,8 @@ pub mod allocation_strategy;
 pub mod allocator;
 pub mod client;
 pub mod disk_tier;
+#[cfg(feature = "etcd")]
+pub mod master_election;
 pub mod master_service;
 pub mod replica;
 pub mod types;
@@ -52,7 +59,9 @@ pub use allocation_strategy::{
 pub use allocator::{AllocatedBuffer, BufferAllocator, OffsetBufferAllocator};
 pub use client::{DummyClient, RealClient};
 pub use disk_tier::DiskTier;
-pub use master_service::MasterService;
+#[cfg(feature = "etcd")]
+pub use master_election::{Leadership, MasterElection};
+pub use master_service::{MasterService, MasterSnapshot, ObjectSnapshot, SegmentSnapshot};
 pub use replica::{Replica, ReplicaData, ReplicaList, ReplicaStatus};
 pub use types::{ErrorCode, ObjectKey, ReplicaId, ReplicateConfig, SegmentName, Slice};
 

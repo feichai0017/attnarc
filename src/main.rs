@@ -1,5 +1,7 @@
 mod cluster;
 mod gateway;
+mod pd;
+mod pd_proxy;
 mod store_master_http;
 mod transfer_node;
 
@@ -56,6 +58,24 @@ enum Command {
         #[arg(long, default_value_t = 12)]
         requests: usize,
     },
+    /// Run the disaggregated prefill/decode demo: the control plane emits a
+    /// Disaggregated plan, then the freshly-prefilled KV moves from the prefill
+    /// node to the decode node over the transfer engine, identity-guarded.
+    Pd,
+    /// Run the P/D proxy: an OpenAI-compatible front that orchestrates
+    /// prefill → store → decode across two engines sharing a QuillCache store
+    /// (puts the store on the request hot path). The prefill engine offloads the
+    /// prefix KV; the decode engine reuses it from the store.
+    PdProxy {
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        bind: String,
+        /// Base URL of the prefill engine (its connector offloads KV).
+        #[arg(long)]
+        prefill: String,
+        /// Base URL of the decode engine (its connector loads KV).
+        #[arg(long)]
+        decode: String,
+    },
     /// Run the store's MasterService over HTTP (Mooncake's master service): the
     /// two-phase Put, identity-guarded Get, Mount, Remove, for out-of-process
     /// engine KV connectors. Object bytes still move via the transfer engine.
@@ -64,6 +84,23 @@ enum Command {
         addr: String,
         #[arg(long, default_value = "random")]
         strategy: String,
+        /// Snapshot file — recovered on startup if present, saved periodically
+        /// (HA: a restarted or newly-elected master rebuilds its state from it).
+        #[arg(long)]
+        snapshot: Option<String>,
+        /// Seconds between periodic snapshots (0 disables).
+        #[arg(long, default_value_t = 5)]
+        snapshot_interval: u64,
+        /// Seconds a segment may miss heartbeats before it's dead (0 = health off).
+        #[arg(long, default_value_t = 0)]
+        segment_ttl: u64,
+        /// Comma-separated etcd endpoints → multi-master leader election (HA mode;
+        /// needs `--features etcd`). Only the elected leader serves.
+        #[arg(long)]
+        etcd: Option<String>,
+        /// This master's id (the leader value in the election).
+        #[arg(long, default_value = "master-0")]
+        node_id: String,
     },
     /// Run a standalone Transfer Engine storage node serving one named RAM
     /// segment over the (segment, offset) wire — where a store client / engine
@@ -90,8 +127,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Gateway { config } => run_from_config_path(config).await?,
         Command::Plan => print_plan(),
         Command::Cluster { nodes, requests } => cluster::run_cluster(nodes, requests).await?,
-        Command::StoreMaster { addr, strategy } => {
-            store_master_http::run_store_master(addr, strategy).await?
+        Command::Pd => pd::run_pd_demo().await?,
+        Command::PdProxy {
+            bind,
+            prefill,
+            decode,
+        } => pd_proxy::run_pd_proxy(bind, prefill, decode).await?,
+        Command::StoreMaster {
+            addr,
+            strategy,
+            snapshot,
+            snapshot_interval,
+            segment_ttl,
+            etcd,
+            node_id,
+        } => {
+            store_master_http::run_store_master(store_master_http::StoreMasterOpts {
+                addr,
+                strategy,
+                snapshot,
+                snapshot_interval_secs: snapshot_interval,
+                segment_ttl,
+                etcd,
+                node_id,
+            })
+            .await?
         }
         Command::TransferNode { addr, segment } => {
             transfer_node::run_transfer_node(addr, segment).await?

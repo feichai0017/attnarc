@@ -4,17 +4,19 @@ members = [
     "crates/quillcache-core",
     "crates/quillcache-store",
     "crates/quillcache-transfer-engine",
+    "crates/quillcache-cuda",
 ]
 default-members = [
     ".",
     "crates/quillcache-core",
     "crates/quillcache-store",
     "crates/quillcache-transfer-engine",
+    "crates/quillcache-cuda",
 ]
-# The CUDA device tier is excluded so the default build never resolves/compiles
-# cudarc on a machine with no NVIDIA GPU. Build it standalone on a GPU box:
-#   cd crates/quillcache-cuda && cargo build --features cuda
-exclude = ["crates/quillcache-cuda"]
+# quillcache-cuda is a workspace member, but its DEFAULT build is a host-only stub
+# (no cudarc), so `cargo build`/`test`/CI never need a CUDA toolkit. The real GPU
+# tier compiles with `--features cuda` — cudarc's `dynamic-loading` builds even
+# without CUDA present (it dlopen's libcuda at runtime) and executes on a GPU box.
 resolver = "2"
 
 [workspace.dependencies]
@@ -66,3 +68,6 @@ rocksdb = ["quillcache-core/rocksdb"]
 # the installed binary minimal. Also lets the online gateway back its residency
 # index with Holt (`index: holt` in the gateway config).
 holt = ["quillcache-core/holt"]
+# Multi-master HA for the store-master binary: etcd leader election. Forwards to
+# quillcache-store's etcd feature (pulls etcd-client, build needs protoc).
+etcd = ["quillcache-store/etcd"]

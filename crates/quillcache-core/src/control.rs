@@ -80,6 +80,54 @@ pub struct RequestPlan {
     pub actions: Vec<PlanAction>,
 }
 
+/// The control plane's admission decision (Mooncake's overload-oriented early
+/// rejection): admit with a plan, or reject when the SLO can't be met.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AdmissionDecision {
+    Admit(Box<RequestPlan>),
+    Reject {
+        reason: String,
+        best_slo_violation_us: u64,
+    },
+}
+
+/// The prefill → decode KV handoff a disaggregated plan implies (Mooncake's P/D
+/// data path): the freshly-prefilled blocks the `prefill_worker` computes and
+/// publishes to the store, which the `decode_worker` then reads over the
+/// Transfer Engine before continuing generation. `None` in aggregated mode (the
+/// same worker prefills and decodes, so no KV crosses the wire).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvHandoff {
+    pub request_id: String,
+    pub prefill_worker_id: String,
+    pub decode_worker_id: String,
+    pub blocks: Vec<KvBlockKey>,
+}
+
+impl RequestPlan {
+    /// The disaggregated prefill → decode KV handoff this plan implies, or `None`
+    /// when serving aggregated. The handoff blocks are the plan's `RunPrefill`
+    /// actions — the KV prefill computes that decode must receive.
+    pub fn kv_handoff(&self) -> Option<KvHandoff> {
+        if self.mode != ServingMode::Disaggregated {
+            return None;
+        }
+        let prefill_worker_id = self.prefill_worker_id.clone()?;
+        let blocks = self
+            .actions
+            .iter()
+            .filter(|action| action.kind == PlanActionKind::RunPrefill)
+            .filter_map(|action| action.key.clone())
+            .collect();
+        Some(KvHandoff {
+            request_id: self.route.request_id.clone(),
+            prefill_worker_id,
+            decode_worker_id: self.decode_worker_id.clone(),
+            blocks,
+        })
+    }
+}
+
 /// Translate a batch of engine KV events into residency updates against any
 /// [`IndexBackend`].
 ///
@@ -224,6 +272,10 @@ pub struct ControlPlane {
     conductor: Conductor,
     use_conductor: bool,
     cost_model: CostModel,
+    /// Overload admission: reject a request if the best worker would still
+    /// violate its SLO by more than this many microseconds. `None` admits all
+    /// (Mooncake's overload-oriented early rejection).
+    max_slo_violation_us: Option<u64>,
 }
 
 impl ControlPlane {
@@ -263,6 +315,7 @@ impl ControlPlane {
             conductor: Conductor::new(),
             use_conductor: false,
             cost_model: CostModel::default(),
+            max_slo_violation_us: None,
         }
     }
 
@@ -273,6 +326,33 @@ impl ControlPlane {
     pub fn with_conductor_routing(mut self, on: bool) -> Self {
         self.use_conductor = on;
         self
+    }
+
+    /// Enable overload admission: reject a request when even the best worker
+    /// would violate its SLO by more than `max_violation_us` (Mooncake's
+    /// overload-oriented early rejection). Off by default (admit all).
+    pub fn with_admission_slo_limit(mut self, max_violation_us: u64) -> Self {
+        self.max_slo_violation_us = Some(max_violation_us);
+        self
+    }
+
+    /// Plan the request, then either admit it or **reject it early** if even the
+    /// best worker would violate the SLO past the configured limit (overload).
+    /// With no limit set, always admits.
+    pub fn admit(&self, request: &RequestShape) -> Result<AdmissionDecision, ControlError> {
+        let plan = self.plan(request)?;
+        if let Some(limit) = self.max_slo_violation_us {
+            if plan.route.slo_violation_us > limit {
+                return Ok(AdmissionDecision::Reject {
+                    reason: format!(
+                        "overloaded: best worker '{}' would violate SLO by {}us (limit {}us)",
+                        plan.route.worker_id, plan.route.slo_violation_us, limit
+                    ),
+                    best_slo_violation_us: plan.route.slo_violation_us,
+                });
+            }
+        }
+        Ok(AdmissionDecision::Admit(Box::new(plan)))
     }
 
     /// The request's `ModelContext` + its prefix-inclusive block hashes — the
@@ -1141,5 +1221,86 @@ mod tests {
             .actions
             .iter()
             .any(|action| action.kind == PlanActionKind::Decode));
+
+        // The disaggregated plan implies a concrete prefill→decode KV handoff:
+        // the cold block prefill-a computes is what decode-a must receive.
+        let handoff = plan.kv_handoff().expect("disaggregated plan has a handoff");
+        assert_eq!(handoff.request_id, "req-pd");
+        assert_eq!(handoff.prefill_worker_id, "prefill-a");
+        assert_eq!(handoff.decode_worker_id, "decode-a");
+        assert_eq!(handoff.blocks.len(), 1);
+    }
+
+    #[test]
+    fn aggregated_plan_has_no_kv_handoff() {
+        // A single aggregated worker prefills and decodes in place — no KV
+        // crosses the wire, so there is no prefill→decode handoff.
+        let control = ControlPlane::new(vec![engine()]);
+        let request = RequestShape {
+            id: "req-agg".to_string(),
+            model_id: "Qwen/Qwen3-0.6B".to_string(),
+            tokenizer_id: "Qwen/Qwen3-0.6B".to_string(),
+            adapter_id: None,
+            tenant_id: "tenant-a".to_string(),
+            session_id: None,
+            blocks: vec![KvBlockKey::new(
+                "Qwen/Qwen3-0.6B",
+                "Qwen/Qwen3-0.6B",
+                "tenant-a",
+                "root",
+                "cold",
+                0,
+                64,
+            )],
+            estimated_decode_tokens: 16,
+            slo: SloTarget::default(),
+        };
+        let plan = control.plan(&request).unwrap();
+        assert_eq!(plan.mode, ServingMode::Aggregated);
+        assert!(plan.kv_handoff().is_none());
+    }
+
+    #[test]
+    fn overload_admission_rejects_when_slo_cannot_be_met() {
+        let cold = RequestShape {
+            id: "r".to_string(),
+            model_id: "Qwen/Qwen3-0.6B".to_string(),
+            tokenizer_id: "Qwen/Qwen3-0.6B".to_string(),
+            adapter_id: None,
+            tenant_id: "tenant-a".to_string(),
+            session_id: None,
+            blocks: vec![KvBlockKey::new(
+                "Qwen/Qwen3-0.6B",
+                "Qwen/Qwen3-0.6B",
+                "tenant-a",
+                "root",
+                "cold",
+                0,
+                64,
+            )],
+            estimated_decode_tokens: 16,
+            // A zero TTFT/TPOT budget can't be met by any prefill.
+            slo: SloTarget {
+                ttft_ms: 0,
+                tpot_ms: 0,
+            },
+        };
+
+        // With a zero violation budget, the request is rejected early (overload).
+        let strict = ControlPlane::new(vec![engine()]).with_admission_slo_limit(0);
+        match strict.admit(&cold).unwrap() {
+            AdmissionDecision::Reject {
+                best_slo_violation_us,
+                ..
+            } => assert!(best_slo_violation_us > 0),
+            other => panic!("expected Reject, got {other:?}"),
+        }
+
+        // Default (no admission limit) admits the same request.
+        let lenient = ControlPlane::new(vec![engine()]);
+        assert!(matches!(
+            lenient.admit(&cold).unwrap(),
+            AdmissionDecision::Admit(_)
+        ));
     }
 }

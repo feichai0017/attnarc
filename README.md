@@ -55,14 +55,14 @@ differentiation on top:
 
 | Mooncake / Dynamo | QuillCache | Status |
 | --- | --- | --- |
-| Transfer Engine (`TransferEngine` + `Transport`) | `quillcache-transfer-engine` (`engine` + `transport::{tcp,rdma,nvlink}`) | ✅ TCP / ⊙ RDMA · NVLink reserved |
+| Transfer Engine (`TransferEngine` + `Transport`; host **& GPU HBM** segments) | `quillcache-transfer-engine` (`engine` · `transport::{tcp,rdma,nvlink}` · `device_segment`) | ✅ TCP · ✅ **GPU HBM segment** (L4) / ⊙ RDMA · NVLink reserved |
 | Store `Client` (`PutStart`/`PutEnd`/`Get`) | `DummyClient` / `RealClient` | ✅ end-to-end over the transfer engine |
-| Store `MasterService` (two-phase Put, eviction) | `MasterService` | ✅ replica alloc · lease eviction |
+| Store `MasterService` (two-phase Put, eviction, **HA**) | `MasterService` + snapshot/recovery + heartbeat health + `MasterElection` | ✅ alloc · lease evict · **crash-safe snapshot + failover** · etcd leader-election (verified) |
 | `BufferAllocator` + `AllocationStrategy` | `OffsetBufferAllocator` + `Random`/`FreeRatioFirst` | ✅ |
 | `TransferMetadata` (etcd/redis/http/p2p) | `MetadataBackend`: `InMemoryMetadata` / `EtcdMetadata` (feature `etcd`) | ✅ in-memory · ✅ etcd (verified vs real etcd) |
 | Dynamo KV-router cost function | `DynamoCostRouter` | ✅ reproduces the worked example |
-| Dynamo KVBM tiers (G1 HBM / G2 host / G3 disk) | `StoreDataPlane` (DRAM/SSD) + `quillcache-cuda` (HBM G1 + FP8 quantize) | ✅ DRAM/SSD · ⊙ HBM (GPU box) |
-| Mooncake GPU data path (GPUDirect-RDMA · NVLink · GDS) | `rdma` / `nvlink` reserved transports | ⊙ needs a GPU / NIC |
+| Dynamo KVBM tiers (G1 HBM / G2 host / G3 disk) | `StoreDataPlane` (DRAM/SSD) + `quillcache-cuda` (HBM G1 + FP8 quantize) | ✅ DRAM/SSD · ✅ **HBM H2D/D2H** (L4) · FP8 quantize (GPU+NVRTC) |
+| Mooncake GPU data path (device segment · GPUDirect-RDMA · NVLink · GDS) | `device_segment` (HBM, cudaMemcpy) · `rdma`/`nvlink` (zero-copy) | ✅ **HBM segment** (L4) · ⊙ GPUDirect/NVLink need a NIC/multi-GPU |
 | Mooncake Conductor / Dynamo KV-Cache Indexer | `conductor` (`PrefixCacheTable` + `ModelContext` + `KVEventHandler`) + residency index (Holt ART) | ✅ longest-prefix overlap · persistent |
 | — *(neither does this)* | **identity guard + crash-consistent `DiskTier`** | 🎯 differentiation |
 
@@ -72,9 +72,9 @@ differentiation on top:
 | --- | --- |
 | `quillcache` (bin) | the OpenAI-compatible **gateway** (proxy · cache-aware routing · streaming · SLO), the local **cluster** demo, and `bench-index` |
 | `quillcache-core` | `KvBlockKey` / `IdentityScope` identity, `CostModel`, `ReuseViolation`; the `router` (incl. `DynamoCostRouter`), `control` plane, `DataPlane` + `IndexBackend` traits, the ART-vs-LSM `bench`, and the feature-gated `index_holt` / `index_rocksdb` backends |
-| `quillcache-transfer-engine` | faithful port of Mooncake's Transfer Engine: `TransferEngine` + `MultiTransport` + `Transport` (`tcp` real / `rdma` reserved) + `TransferMetadata` + `Topology` |
+| `quillcache-transfer-engine` | faithful port of Mooncake's Transfer Engine: `TransferEngine` + `MultiTransport` + `Transport` (`tcp` real · `rdma`/`nvlink` reserved) + `device_segment` (GPU HBM segment, `--features cuda`, **L4-verified**) + `TransferMetadata` + `Topology` |
 | `quillcache-store` | faithful port of `mooncake-store`: `Client`, `MasterService`, `OffsetBufferAllocator`, `AllocationStrategy`, `Replica`, the crash-consistent `DiskTier`, plus `LocalKvStore` (byte pool) + `StoreDataPlane` (tiers) |
-| `quillcache-cuda` | CUDA device tier: HBM↔host copies + FP8 quantize-on-offload (feature-gated, excluded from the default workspace) |
+| `quillcache-cuda` | CUDA device tier (Dynamo-KVBM G1): real HBM↔host copies + FP8 quantize-on-offload via **cudarc 0.19**. Workspace member; default build is a host-only **stub**, `--features cuda` is the real path (cudarc `dynamic-loading` → compiles with no CUDA toolkit; **L4-verified**) |
 
 The two index backends (`index_holt`, `index_rocksdb`) are **feature-gated modules
 inside `quillcache-core`**, off by default — `holt` is pure Rust; `rocksdb` pulls a
@@ -91,18 +91,42 @@ how far each piece is integrated:
 - **▣ tested unit (not yet on the live gateway path)** — the faithful store: a
   `Client` Put→Get over the transfer engine (real TCP), the `MasterService`
   two-phase Put + lease eviction, the identity guard, and `DiskTier` crash
-  recovery. All covered by tests (and the `cluster` demo); wiring them into the
-  live gateway needs an engine KV-connector for the engine⟷store byte handoff.
+  recovery. All covered by tests (and the `cluster` + `pd` demos); the engine⟷store
+  byte handoff is the vLLM KV connector below (GPU-verified).
 - **◑ real, behind a feature / needs infra to run** — the `EtcdMetadata` backend
   (behind `etcd` — real etcd-client code + a background-watch-synced cache,
   compile-checked in CI and **verified against a real etcd in Docker**: two
   backends discover a segment via the etcd watch; the integration test is
-  `#[ignore]` since CI has no etcd).
+  `#[ignore]` since CI has no etcd). The **master's HA** rides the same seam:
+  `MasterService` snapshot/recovery (atomic) + heartbeat segment-health are unit
+  tested, and `MasterElection` (multi-master etcd leader election + lease
+  failover, `--features etcd`) is **verified against a real etcd in Docker**
+  (`#[ignore]`).
+- **◑ real, behind a feature / verified on a GPU** — the CUDA device tier
+  (`quillcache-cuda --features cuda`: HBM↔host H2D/D2H, FP8 quantize via NVRTC) and
+  the Transfer Engine **GPU HBM device segment** (`quillcache-transfer-engine
+  --features cuda`: register HBM, serve it over the one-sided `(offset,len)` wire so
+  an *unmodified* TCP peer reads/writes GPU-resident bytes). Both **verified on a
+  Modal NVIDIA L4** (`deploy/modal_cuda_verify.py`); cudarc `dynamic-loading` means
+  they compile with no CUDA toolkit (CI compile-checks both), GPU tests `#[ignore]`.
+- **◑ real, verified on a GPU (Modal L4)** — the vLLM 0.22.1 KV connector
+  (`bridge/quillcache_v1_connector.py`, a real `KVConnectorBase_V1`): a prompt's KV
+  is offloaded to the store and **reused** on a later request
+  (`deploy/modal_vllm_connector.py`), and — **disaggregated** — prefill on GPU 0 →
+  store → decode on GPU 1, KV computed on one instance reused by another over the
+  transfer engine (`deploy/modal_vllm_pd.py`). This includes **true vLLM-native P/D**
+  (`deploy/modal_vllm_disagg.py`): prefill as `kv_producer`, decode as `kv_consumer`,
+  and `pd-proxy` as the router minting a `transfer_id` for vLLM's `kv_transfer_params`
+  handshake — the consumer pulls the producer's KV *by id* and skips prefill, with
+  output matching a monolithic run token-for-token. The store is the same
+  identity-guarded `MasterService`; the local (no-GPU) form is `cargo run -- pd`.
 - **⊙ reserved / needs hardware** — `RdmaTransport` / `NvlinkTransport` (behind
-  `rdma` / `nvlink`) and the CUDA device tier (`quillcache-cuda --features cuda` on
-  a GPU box). Real interfaces, stubbed so the default build is hardware-free.
+  `rdma` / `nvlink`): GPUDirect-RDMA / NVLink *zero-copy* needs a NIC / multi-GPU.
+  Real interfaces, stubbed so the default build stays hardware-free.
 
-`cargo test` — 60 tests pass; `cargo fmt --check` and `cargo clippy` are clean.
+`cargo test` — 79 tests pass; `cargo fmt --check` and `cargo clippy` are clean. The
+CUDA paths add 2 GPU tests (`#[ignore]`, L4-verified) and a `--features cuda`
+compile-check job in CI.
 
 ## The storage study: ART (Holt) vs LSM (RocksDB)
 
@@ -173,6 +197,11 @@ cargo test
 # transfer engine.
 cargo run -- cluster --nodes 4 --requests 12
 
+# Disaggregated prefill/decode demo: the control plane emits a Disaggregated
+# plan, then the freshly-prefilled KV moves prefill-node → decode-node over the
+# transfer engine (identity-guarded). Mooncake's P/D data path, no GPU.
+cargo run -- pd
+
 # The ART-vs-LSM storage study (needs a C++ toolchain for RocksDB).
 cargo run --features "rocksdb holt" -- bench-index --backend holt
 cargo run --features "rocksdb holt" -- bench-index --backend rocksdb
@@ -184,8 +213,12 @@ cargo run --features "rocksdb holt" -- bench-index --backend rocksdb
 cargo run -- gateway --config examples/quillcache-gateway.yaml
 cargo run --features holt -- gateway --config examples/quillcache-gateway.yaml
 
-# Build the CUDA device tier on a GPU box (excluded from the default workspace):
-cd crates/quillcache-cuda && cargo build --features cuda
+# The CUDA paths: the device tier (HBM↔host + FP8 quantize) and the Transfer
+# Engine GPU HBM segment. cudarc `dynamic-loading` compiles them with no CUDA
+# toolkit; the GPU round-trip tests are `#[ignore]`, so run them on a GPU box.
+cargo build -p quillcache-cuda --features cuda
+cargo build -p quillcache-transfer-engine --features cuda
+modal run deploy/modal_cuda_verify.py   # verified on a Modal NVIDIA L4
 ```
 
 ## Non-goals
