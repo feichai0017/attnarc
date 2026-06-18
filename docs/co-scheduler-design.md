@@ -171,13 +171,19 @@ The initial policy should be deliberately simple and measurable.
 
 ### P0: Design-stable metrics and actions
 
-- Add `CoSchedulerSnapshot` and `CoSchedulerAction` data types.
+- Add `CoSchedulerSnapshot`, `CoSchedulerTelemetry`, `CoSchedulerAction`, and
+  `CoSchedulerPlan` data types.
+- Build `ControlPlane::co_scheduler_snapshot(...)` from live workers,
+  residency/data-plane metrics, and hot-prefix counters.
+- Expose a `/v1/state.co_scheduler` dry-run plan in the gateway. P0 emits
+  suggestions only; it does not mutate routing, placement, or worker roles.
 - Export metrics for time-to-first-layer, full-transfer time, overlap saved ms,
   HBM/DRAM/SSD pressure, and predicted-vs-actual TTFT.
 - Add a dry-run controller that logs actions without applying them.
 
-Acceptance: static serving behavior is unchanged; `/metrics` exposes the new
-signals; unit tests cover action serialization and epoch rejection.
+Acceptance: static serving behavior is unchanged; `/v1/state` exposes the
+co-scheduler snapshot and dry-run plan; unit tests cover the first action
+selection rules. Stale-epoch rejection belongs to the actuator in P2.
 
 ### P1: Layer-aware store object model
 

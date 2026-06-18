@@ -6,10 +6,11 @@ use crate::router::{
     plan_for_worker, GreedyStatePlaneRouter, RouteDecision, RouterError, RoutingPolicy,
 };
 use crate::{
-    BlockRemovedEvent, BlockStoredEvent, CacheResidency, CacheTier, Conductor, CostModel,
-    DataPlane, DataPlaneAction, DataPlaneUpdate, EngineEndpoint, EngineRole, ExternalKvBlockKey,
-    IdentityScope, IndexBackend, KvBlockKey, KvCacheEvent, KvEvent, KvEventBatch, MemoryIndex,
-    ModelContext, NoDataPlane, RequestShape, ReuseViolation, WorkerState,
+    BlockRemovedEvent, BlockStoredEvent, CacheResidency, CacheTier, CoSchedulerSnapshot,
+    CoSchedulerTelemetry, Conductor, CostModel, DataPlane, DataPlaneAction, DataPlaneUpdate,
+    EngineEndpoint, EngineRole, ExternalKvBlockKey, HotPrefixObservation, IdentityScope,
+    IndexBackend, KvBlockKey, KvCacheEvent, KvEvent, KvEventBatch, MemoryIndex, ModelContext,
+    NoDataPlane, RequestShape, ReuseViolation, TierObservation, WorkerState,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -704,6 +705,83 @@ impl ControlPlane {
         self.residency.as_ref()
     }
 
+    /// Build the fleet snapshot consumed by the cluster co-scheduler. The live
+    /// worker/index/data-plane state comes from this control plane; gateway or
+    /// engine telemetry supplies SLO/cache/transfer observations.
+    pub fn co_scheduler_snapshot(
+        &self,
+        epoch: u64,
+        telemetry: CoSchedulerTelemetry,
+        hotness_threshold: u32,
+    ) -> CoSchedulerSnapshot {
+        let data_plane_metrics = self.data_plane.metrics();
+        let residency = self.residency.snapshot();
+        let worker_hbm_used: u64 = self.workers.iter().map(|w| w.hbm_used_bytes).sum();
+        let worker_cpu_used: u64 = self.workers.iter().map(|w| w.cpu_used_bytes).sum();
+        let hbm_capacity: u64 = self.workers.iter().map(|w| w.hbm_capacity_bytes).sum();
+        let cpu_capacity: u64 = self.workers.iter().map(|w| w.cpu_capacity_bytes).sum();
+        let residency_hbm_bytes: u64 = residency
+            .iter()
+            .filter(|r| matches!(r.tier, CacheTier::Hbm | CacheTier::RemoteHbm))
+            .map(|r| r.bytes)
+            .sum();
+        let residency_cpu_bytes: u64 = residency
+            .iter()
+            .filter(|r| r.tier == CacheTier::CpuDram)
+            .map(|r| r.bytes)
+            .sum();
+        let residency_ssd_bytes: u64 = residency
+            .iter()
+            .filter(|r| r.tier == CacheTier::LocalSsd)
+            .map(|r| r.bytes)
+            .sum();
+        let hot_prefixes = self
+            .hotness
+            .hot(hotness_threshold)
+            .into_iter()
+            .map(|(scope, prefix_hash, accesses)| {
+                let resident = self.residency.prefix_scan(&scope, &prefix_hash);
+                let mut holders: Vec<String> = resident
+                    .iter()
+                    .filter(|r| matches!(r.tier, CacheTier::Hbm | CacheTier::RemoteHbm))
+                    .map(|r| r.worker_id.clone())
+                    .collect();
+                holders.sort();
+                holders.dedup();
+                HotPrefixObservation {
+                    prefix_hash,
+                    holders,
+                    estimated_hits_per_interval: u64::from(accesses),
+                    bytes: resident.iter().map(|r| r.bytes).sum(),
+                }
+            })
+            .collect();
+
+        CoSchedulerSnapshot {
+            epoch,
+            workers: self.workers.clone(),
+            slo: telemetry.slo,
+            cache: telemetry.cache,
+            transfer: telemetry.transfer,
+            tier: TierObservation {
+                hbm_used_bytes: data_plane_metrics
+                    .hbm_bytes
+                    .max(worker_hbm_used)
+                    .max(residency_hbm_bytes),
+                hbm_capacity_bytes: hbm_capacity,
+                cpu_dram_used_bytes: data_plane_metrics
+                    .cpu_dram_bytes
+                    .max(worker_cpu_used)
+                    .max(residency_cpu_bytes),
+                cpu_dram_capacity_bytes: cpu_capacity,
+                local_ssd_used_bytes: data_plane_metrics.local_ssd_bytes.max(residency_ssd_bytes),
+                local_ssd_capacity_bytes: 0,
+                evictions: data_plane_metrics.evictions,
+            },
+            hot_prefixes,
+        }
+    }
+
     /// Decide which hot prefixes to replicate to spread cache hotspots: live
     /// access counts (the request path feeds the hotness tracker) crossed with
     /// where each hot prefix is resident (HBM) and current worker load. The cost
@@ -1287,6 +1365,56 @@ mod tests {
         // A data plane (LMCache/KVBM/FlexKV adapter) plugs in at this seam.
         let control = control.with_data_plane(Box::new(MockDataPlane::new()));
         assert_eq!(control.data_plane().name(), "mock");
+    }
+
+    #[test]
+    fn co_scheduler_snapshot_reads_live_control_plane_state() {
+        let mut control = ControlPlane::new(vec![engine()]);
+        let request = RequestShape {
+            id: "req-hot".to_string(),
+            model_id: "Qwen/Qwen3-0.6B".to_string(),
+            tokenizer_id: "Qwen/Qwen3-0.6B".to_string(),
+            adapter_id: None,
+            tenant_id: "tenant-a".to_string(),
+            session_id: None,
+            blocks: vec![KvBlockKey::new(
+                "Qwen/Qwen3-0.6B",
+                "Qwen/Qwen3-0.6B",
+                "tenant-a",
+                "root",
+                "hot",
+                0,
+                64,
+            )],
+            estimated_decode_tokens: 16,
+            slo: SloTarget::default(),
+        };
+
+        for _ in 0..8 {
+            control.plan(&request).unwrap();
+        }
+        control.observe_placement("vllm-a", &request, 4 * 1024 * 1024);
+
+        let snapshot = control.co_scheduler_snapshot(
+            42,
+            CoSchedulerTelemetry {
+                cache: crate::CacheObservation {
+                    remote_hits: 4,
+                    remote_hit_rate_pct: Some(50.0),
+                    ..crate::CacheObservation::default()
+                },
+                ..CoSchedulerTelemetry::default()
+            },
+            8,
+        );
+
+        assert_eq!(snapshot.epoch, 42);
+        assert_eq!(snapshot.workers.len(), 1);
+        assert_eq!(snapshot.tier.hbm_used_bytes, 4 * 1024 * 1024);
+        assert_eq!(snapshot.hot_prefixes.len(), 1);
+        assert_eq!(snapshot.hot_prefixes[0].prefix_hash, "root");
+        assert_eq!(snapshot.hot_prefixes[0].holders, vec!["vllm-a"]);
+        assert_eq!(snapshot.cache.remote_hit_rate_pct, Some(50.0));
     }
 
     #[test]

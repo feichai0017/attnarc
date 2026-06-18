@@ -18,6 +18,7 @@ use std::fmt;
 use std::str::FromStr;
 
 pub mod bench;
+pub mod co_scheduler;
 pub mod conductor;
 pub mod control;
 pub mod replication;
@@ -31,6 +32,7 @@ pub mod index_holt;
 #[cfg(feature = "rocksdb")]
 pub mod index_rocksdb;
 
+pub use co_scheduler::*;
 pub use conductor::{Conductor, KVEventHandler, KvCacheEvent, ModelContext, PrefixCacheTable};
 pub use control::*;
 pub use router::*;

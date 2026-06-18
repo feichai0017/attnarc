@@ -5,7 +5,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
-use quillcache_core::{ControlPlane, IngestSummary, PlanAction, RequestPlan, ServingMode};
+use quillcache_core::{
+    CacheObservation, CoScheduler, CoSchedulerTelemetry, ControlPlane, IngestSummary, PlanAction,
+    RequestPlan, ServingMode, SloObservation, TransferObservation,
+};
 use quillcache_core::{
     DataPlane, DataPlaneAction, EngineEndpoint, ExternalKvBlockKey, IndexBackend, KvBlockKey,
     KvEventBatch, MemoryIndex, NoDataPlane, RequestKvHints, RequestShape, SloTarget,
@@ -159,14 +162,36 @@ struct SloGoodput {
     served: AtomicU64,
     met: AtomicU64,
     ttft_ms_sum: AtomicU64,
+    ttft_budget_ms_sum: AtomicU64,
 }
 
 impl SloGoodput {
     fn record(&self, ttft_ms: u64, budget_ms: u64) {
         self.served.fetch_add(1, Ordering::Relaxed);
         self.ttft_ms_sum.fetch_add(ttft_ms, Ordering::Relaxed);
+        self.ttft_budget_ms_sum
+            .fetch_add(budget_ms, Ordering::Relaxed);
         if ttft_ms <= budget_ms {
             self.met.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn observation(&self) -> SloObservation {
+        let served = self.served.load(Ordering::Relaxed);
+        if served == 0 {
+            return SloObservation::default();
+        }
+        let met = self.met.load(Ordering::Relaxed);
+        let ttft_sum = self.ttft_ms_sum.load(Ordering::Relaxed);
+        let budget_sum = self.ttft_budget_ms_sum.load(Ordering::Relaxed);
+        SloObservation {
+            ttft_p99_ms: None,
+            ttft_mean_ms: Some(ttft_sum as f64 / served as f64),
+            tpot_p99_ms: None,
+            ttft_budget_ms: Some(budget_sum / served),
+            tpot_budget_ms: None,
+            slo_miss_pct: pct(served.saturating_sub(met), served),
+            goodput_pct: pct(met, served),
         }
     }
 
@@ -174,11 +199,13 @@ impl SloGoodput {
         let served = self.served.load(Ordering::Relaxed);
         let met = self.met.load(Ordering::Relaxed);
         let sum = self.ttft_ms_sum.load(Ordering::Relaxed);
+        let observation = self.observation();
         json!({
             "served": served,
             "met_slo": met,
-            "goodput_pct": if served > 0 { 100.0 * met as f64 / served as f64 } else { 0.0 },
+            "goodput_pct": observation.goodput_pct.unwrap_or(0.0),
             "mean_ttft_ms": if served > 0 { sum as f64 / served as f64 } else { 0.0 },
+            "mean_ttft_budget_ms": observation.ttft_budget_ms.unwrap_or(0),
         })
     }
 }
@@ -211,6 +238,34 @@ impl GatewayMetrics {
         self.reuse_refused_total
             .fetch_add(t.reuse_refused as u64, Ordering::Relaxed);
     }
+
+    fn observation(&self) -> CacheObservation {
+        let requests = self.requests_total.load(Ordering::Relaxed);
+        let reusable_blocks = self.reusable_blocks_total.load(Ordering::Relaxed);
+        let local_hits = self.local_hits_total.load(Ordering::Relaxed);
+        let remote_hits = self.transfer_blocks_total.load(Ordering::Relaxed);
+        let recompute_blocks = self.recompute_blocks_total.load(Ordering::Relaxed);
+        let reuse_refused = self.reuse_refused_total.load(Ordering::Relaxed);
+        let routed_blocks = local_hits + remote_hits + recompute_blocks;
+        CacheObservation {
+            requests,
+            reusable_blocks,
+            local_hits,
+            remote_hits,
+            recompute_blocks,
+            reuse_refused,
+            local_hit_rate_pct: pct(local_hits, routed_blocks),
+            remote_hit_rate_pct: pct(remote_hits, routed_blocks),
+        }
+    }
+}
+
+fn pct(numerator: u64, denominator: u64) -> Option<f64> {
+    if denominator == 0 {
+        None
+    } else {
+        Some(100.0 * numerator as f64 / denominator as f64)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -220,6 +275,8 @@ struct GatewayState {
     action_sink: Option<ActionSink>,
     slo: Arc<SloGoodput>,
     metrics: Arc<GatewayMetrics>,
+    co_scheduler: Arc<CoScheduler>,
+    co_scheduler_epoch: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -412,6 +469,8 @@ pub async fn run(config: GatewayConfig) -> Result<(), GatewayError> {
         action_sink,
         slo: Arc::new(SloGoodput::default()),
         metrics: Arc::new(GatewayMetrics::default()),
+        co_scheduler: Arc::new(CoScheduler::default()),
+        co_scheduler_epoch: Arc::new(AtomicU64::new(0)),
     };
     let control = state.control.clone();
     let app = router(state);
@@ -651,6 +710,25 @@ async fn metrics_endpoint(State(state): State<GatewayState>) -> impl IntoRespons
 
 async fn state_snapshot(State(state): State<GatewayState>) -> impl IntoResponse {
     let control = state.control.read().await;
+    let epoch = state
+        .co_scheduler_epoch
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    let hotness_threshold = state
+        .co_scheduler
+        .policy
+        .min_hot_prefix_hits
+        .min(u64::from(u32::MAX)) as u32;
+    let co_scheduler_snapshot = control.co_scheduler_snapshot(
+        epoch,
+        CoSchedulerTelemetry {
+            slo: state.slo.observation(),
+            cache: state.metrics.observation(),
+            transfer: TransferObservation::default(),
+        },
+        hotness_threshold,
+    );
+    let co_scheduler_plan = state.co_scheduler.dry_run(&co_scheduler_snapshot);
     Json(json!({
         "engines": control.engines(),
         "workers": control.workers(),
@@ -661,6 +739,11 @@ async fn state_snapshot(State(state): State<GatewayState>) -> impl IntoResponse 
         "data_plane_residency": control.data_plane().snapshot(),
         "action_sink": state.action_sink.as_ref().map(ActionSink::snapshot).unwrap_or_else(ActionSinkSnapshot::disabled),
         "slo_goodput": state.slo.snapshot(),
+        "co_scheduler": {
+            "policy": state.co_scheduler.policy,
+            "snapshot": co_scheduler_snapshot,
+            "dry_run_plan": co_scheduler_plan,
+        },
         "resident_blocks": control.residency().len(),
         "residency": control.residency().snapshot(),
     }))
