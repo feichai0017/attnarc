@@ -79,6 +79,7 @@ per attention backend) and swaps disk-safetensors for the identity-guarded store
 | `quillcache_store_client.py` (master HTTP + transfer wire) | **real, tested** (the local e2e above) |
 | connector offload / load (two-phase Put, identity-guarded Get) | **real, tested** (the local e2e above) |
 | vLLM `KVConnectorBase_V1` connector + KV-tensor (de)serialization | **real, L4-verified** (`deploy/modal_vllm_connector.py`) |
+| connector → gateway layer-transfer telemetry | **real, code-wired** — set `gateway_url` / `telemetry_url` and real vLLM KV loads post `/v1/transfer-telemetry` |
 | content-addressed P/D (prefill → store → decode via `pd-proxy`, `kv_both`) | **real, 2×L4-verified** (`deploy/modal_vllm_pd.py`) |
 | true vLLM-native P/D (`kv_producer`/`kv_consumer` + `transfer_id` handshake) | **real, 2×L4-verified** (`deploy/modal_vllm_disagg.py`) — output matches a monolithic reference token-for-token |
 | multi-node (store on a separate node) | **code-ready** — `master_url` / `segment_endpoints` are arbitrary `host:port`, and the TCP byte path is identical to localhost; only Modal cross-container plumbing (tunnels) remains |

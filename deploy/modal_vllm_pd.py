@@ -79,20 +79,22 @@ def run_pd():
                 time.sleep(1.0)
         raise TimeoutError(f"{name} not ready at {url} within {timeout}s")
 
-    def kv_cfg():
+    def kv_cfg(engine_id):
         return json.dumps({
             "kv_connector": "QuillCacheV1Connector",
             "kv_connector_module_path": "quillcache_v1_connector",
             "kv_role": "kv_both",
             "kv_connector_extra_config": {
                 "master_url": "http://127.0.0.1:7777",
+                "gateway_url": os.environ.get("QC_GATEWAY_URL"),
+                "engine_id": engine_id,
                 "segment_endpoints": {"seg-0": "127.0.0.1:8100"},
                 "tenant_id": "default",
                 "replica_num": 1,
             },
         })
 
-    def serve(port, gpu_ordinal, logpath):
+    def serve(port, gpu_ordinal, logpath, engine_id):
         spawn(
             f"vllm-{port}",
             [
@@ -102,7 +104,7 @@ def run_pd():
                 "--gpu-memory-utilization", "0.55",
                 "--no-enable-prefix-caching",
                 "--disable-hybrid-kv-cache-manager",
-                "--kv-transfer-config", kv_cfg(),
+                "--kv-transfer-config", kv_cfg(engine_id),
             ],
             logpath,
             extra_env={"CUDA_VISIBLE_DEVICES": str(gpu_ordinal)},
@@ -141,8 +143,8 @@ def run_pd():
         wait_ready("http://127.0.0.1:7777/v1/state", 30, "store-master", procs["store-master"][0])
 
         # 2) two vLLM instances: prefill on GPU 0, decode on GPU 1, same store.
-        serve(8000, 0, "/tmp/vllm_prefill.log")
-        serve(8001, 1, "/tmp/vllm_decode.log")
+        serve(8000, 0, "/tmp/vllm_prefill.log", "prefill-engine")
+        serve(8001, 1, "/tmp/vllm_decode.log", "decode-engine")
         wait_ready("http://127.0.0.1:8000/health", 900, "vllm-prefill", procs["vllm-8000"][0])
         wait_ready("http://127.0.0.1:8001/health", 900, "vllm-decode", procs["vllm-8001"][0])
 

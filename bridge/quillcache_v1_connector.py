@@ -1,4 +1,4 @@
-"""A REAL vLLM v1 KV connector backed by the QuillCache store.
+r"""A REAL vLLM v1 KV connector backed by the QuillCache store.
 
 This subclasses vLLM's `KVConnectorBase_V1` (verified against the exact API of
 the deployed vllm 0.22.1 — see deploy/modal_vllm_introspect.py) and is modelled
@@ -45,6 +45,8 @@ Run it (see deploy/modal_vllm_connector.py for the full Modal recipe):
         "kv_role": "kv_both",
         "kv_connector_extra_config": {
           "master_url": "http://127.0.0.1:7777",
+          "gateway_url": "http://127.0.0.1:8080",
+          "engine_id": "vllm-a",
           "segment_endpoints": {"seg-0": "127.0.0.1:8100"},
           "tenant_id": "default",
           "replica_num": 1
@@ -54,6 +56,9 @@ Run it (see deploy/modal_vllm_connector.py for the full Modal recipe):
 
 import concurrent.futures
 import json
+import os
+import time
+import urllib.request
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -117,6 +122,8 @@ class ReqMeta:
     # disaggregation-handshake (`qc-pd/{transfer_id}`, for true mid-request P/D
     # where a router-minted transfer_id — not the prompt content — names the KV).
     key_prefix: str
+    # Best-effort request id for observability; the data path does not depend on it.
+    request_id: str | None = None
 
     @staticmethod
     def make_meta(
@@ -125,6 +132,7 @@ class ReqMeta:
         block_size: int,
         is_store: bool,
         key_prefix: str,
+        request_id: str | None = None,
     ) -> "ReqMeta":
         valid_num_tokens = align_to_block_size(len(token_ids), block_size)
         token_ids_tensor = torch.tensor(token_ids)[:valid_num_tokens]
@@ -141,6 +149,7 @@ class ReqMeta:
             slot_mapping=slot_mapping,
             is_store=is_store,
             key_prefix=key_prefix,
+            request_id=request_id,
         )
 
 
@@ -155,9 +164,12 @@ class QuillCacheConnectorMetadata(KVConnectorMetadata):
         block_size: int,
         is_store: bool,
         key_prefix: str,
+        request_id: str | None = None,
     ) -> None:
         self.requests.append(
-            ReqMeta.make_meta(token_ids, block_ids, block_size, is_store, key_prefix)
+            ReqMeta.make_meta(
+                token_ids, block_ids, block_size, is_store, key_prefix, request_id
+            )
         )
 
 
@@ -197,6 +209,26 @@ class QuillCacheV1Connector(KVConnectorBase_V1):
             endpoints = json.loads(endpoints)
         self._segment_endpoints = dict(endpoints)
         self._replica_num = int(cfg.get_from_extra_config("replica_num", 1))
+        self._engine_id = (
+            cfg.get_from_extra_config("engine_id", None)
+            or getattr(cfg, "engine_id", None)
+            or os.environ.get("QC_ENGINE_ID")
+        )
+        gateway_url = cfg.get_from_extra_config("gateway_url", None) or os.environ.get(
+            "QC_GATEWAY_URL"
+        )
+        telemetry_url = cfg.get_from_extra_config(
+            "telemetry_url", None
+        ) or os.environ.get("QC_TRANSFER_TELEMETRY_URL")
+        if telemetry_url is None and gateway_url:
+            telemetry_url = gateway_url.rstrip("/") + "/v1/transfer-telemetry"
+        self._telemetry_url = telemetry_url.rstrip("/") if telemetry_url else None
+        self._telemetry_backend = cfg.get_from_extra_config(
+            "telemetry_backend", "quillcache-v1-connector"
+        )
+        self._telemetry_timeout_s = float(
+            cfg.get_from_extra_config("telemetry_timeout_s", 0.25)
+        )
 
         # Disaggregation role (vLLM KVTransferConfig.kv_role), using vLLM's own
         # semantics: a pure prefill instance is `kv_producer` (saves a request's
@@ -225,6 +257,9 @@ class QuillCacheV1Connector(KVConnectorBase_V1):
         self._load_forward_context: "ForwardContext | None" = None
         self._load_attn_metadata: Any = None
         self._load_executor: "concurrent.futures.ThreadPoolExecutor | None" = None
+        self._load_telemetry: dict[str, Any] | None = None
+        self._load_max_inflight = 1
+        self._telemetry_executor: "concurrent.futures.ThreadPoolExecutor | None" = None
 
         # The worker owns byte movement; it registers the storage segments on the
         # master so put_start can allocate on them. Idempotent-tolerant.
@@ -241,17 +276,22 @@ class QuillCacheV1Connector(KVConnectorBase_V1):
             # only if StoreMasterClient/TransferEngineClient are thread-safe (then
             # layers also fetch in parallel for bandwidth).
             self._load_executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="qc-kv-load"
+                max_workers=self._load_max_inflight, thread_name_prefix="qc-kv-load"
             )
+            if self._telemetry_url:
+                self._telemetry_executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="qc-telemetry"
+                )
 
         logger.info(
-            "QuillCacheV1Connector role=%s kv_role=%s(producer=%s consumer=%s) master=%s segments=%s identity=%s",
+            "QuillCacheV1Connector role=%s kv_role=%s(producer=%s consumer=%s) master=%s segments=%s telemetry=%s identity=%s",
             role,
             kv_role,
             self._is_producer,
             self._is_consumer,
             self._master.base,
             list(self._segment_endpoints),
+            self._telemetry_url,
             self._identity,
         )
 
@@ -321,6 +361,92 @@ class QuillCacheV1Connector(KVConnectorBase_V1):
     def _deserialize(buf: bytes, device: str) -> torch.Tensor:
         return safetensors.torch.load(buf)["kv"].to(device)
 
+    @staticmethod
+    def _elapsed_us(start_ns: int, end_ns: int) -> int:
+        return max(0, (end_ns - start_ns) // 1_000)
+
+    def _start_load_telemetry(self, requests: list[ReqMeta]) -> dict[str, Any] | None:
+        if not self._telemetry_url:
+            return None
+        request_ids = sorted({r.request_id for r in requests if r.request_id})
+        return {
+            "start_ns": time.monotonic_ns(),
+            "first_layer_ns": None,
+            "layers": 0,
+            "bytes": 0,
+            "pending": 0,
+            "request_id": request_ids[0] if len(request_ids) == 1 else None,
+        }
+
+    def _record_layer_load_result(self, buf: bytes | None) -> None:
+        telemetry = self._load_telemetry
+        if telemetry is None:
+            return
+        now_ns = time.monotonic_ns()
+        if buf is not None:
+            if telemetry["first_layer_ns"] is None:
+                telemetry["first_layer_ns"] = now_ns
+            telemetry["bytes"] += len(buf)
+        telemetry["pending"] -= 1
+        if telemetry["pending"] <= 0:
+            self._finish_load_telemetry(now_ns)
+
+    def _finish_load_telemetry(self, end_ns: int) -> None:
+        telemetry = self._load_telemetry
+        if telemetry is None:
+            return
+        self._load_telemetry = None
+        if telemetry["layers"] <= 0:
+            return
+
+        first_ns = telemetry["first_layer_ns"]
+        first_us = (
+            self._elapsed_us(telemetry["start_ns"], first_ns)
+            if first_ns is not None
+            else None
+        )
+        full_us = self._elapsed_us(telemetry["start_ns"], end_ns)
+        overlap_us = full_us - first_us if first_us is not None else 0
+        payload = {
+            "request_id": telemetry["request_id"],
+            "source_engine_id": None,
+            "target_engine_id": self._engine_id,
+            "backend": self._telemetry_backend,
+            "queue_depth": telemetry["layers"],
+            "telemetry": {
+                "layers": telemetry["layers"],
+                "bytes": telemetry["bytes"],
+                "max_inflight": self._load_max_inflight,
+                "time_to_first_layer_us": first_us,
+                "full_transfer_us": full_us,
+                "overlap_window_us": max(0, overlap_us),
+            },
+        }
+        self._submit_transfer_telemetry(payload)
+
+    def _submit_transfer_telemetry(self, payload: dict[str, Any]) -> None:
+        if not self._telemetry_url:
+            return
+        if self._telemetry_executor is None:
+            self._post_transfer_telemetry(payload)
+            return
+        self._telemetry_executor.submit(self._post_transfer_telemetry, payload)
+
+    def _post_transfer_telemetry(self, payload: dict[str, Any]) -> None:
+        if not self._telemetry_url:
+            return
+        req = urllib.request.Request(
+            self._telemetry_url,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self._telemetry_timeout_s) as resp:
+                resp.read()
+        except Exception as e:
+            logger.debug("transfer telemetry report skipped: %s", e)
+
     # ==============================
     # Worker-side methods
     # ==============================
@@ -358,10 +484,12 @@ class QuillCacheV1Connector(KVConnectorBase_V1):
         behind compute instead of being one synchronous barrier before the pass.
         Mirrors `slice_pool::run_layers_with_notify` on the Rust transfer side."""
         self._pending_layer_loads = {}
+        self._load_telemetry = None
         self._load_forward_context = forward_context
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, QuillCacheConnectorMetadata)
-        n_load = sum(1 for r in metadata.requests if not r.is_store)
+        load_requests = [r for r in metadata.requests if not r.is_store]
+        n_load = len(load_requests)
         attn_metadata = forward_context.attn_metadata
         self._load_attn_metadata = attn_metadata
         if attn_metadata is None:
@@ -373,13 +501,12 @@ class QuillCacheV1Connector(KVConnectorBase_V1):
             return
         if self._load_executor is None:  # scheduler-side connector never loads bytes
             return
+        self._load_telemetry = self._start_load_telemetry(load_requests)
 
         # Submit one prefetch per (load request, attention layer). They run on the
         # background fetch thread while this forward pass proceeds; each is awaited
         # just-in-time in wait_for_layer_load.
-        for request in metadata.requests:
-            if request.is_store:
-                continue
+        for request in load_requests:
             logger.warning(
                 "QC layer-wise loading %d tokens of KV from the store (%s)",
                 len(request.slot_mapping),
@@ -392,6 +519,11 @@ class QuillCacheV1Connector(KVConnectorBase_V1):
                 key = self._layer_key(request.key_prefix, layer_name)
                 fut = self._load_executor.submit(self._get_bytes, key)
                 self._pending_layer_loads.setdefault(layer_name, []).append((request, fut))
+                if self._load_telemetry is not None:
+                    self._load_telemetry["layers"] += 1
+                    self._load_telemetry["pending"] += 1
+        if self._load_telemetry is not None and self._load_telemetry["pending"] == 0:
+            self._load_telemetry = None
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """Block until *this* layer's prefetch lands, then inject it — vLLM calls this
@@ -411,6 +543,7 @@ class QuillCacheV1Connector(KVConnectorBase_V1):
             return
         for request, fut in pending:
             buf = fut.result()  # blocks ONLY on this layer's fetch
+            self._record_layer_load_result(buf)
             if buf is None:
                 continue  # miss / evicted / refused — vLLM recomputes this layer
             kv_cache = self._deserialize(buf, str(kv_cache_layer.device))
@@ -551,6 +684,7 @@ class QuillCacheV1Connector(KVConnectorBase_V1):
                     block_size=self._block_size,
                     is_store=True,
                     key_prefix=self._pd_prefix(self._disagg_save[req_id]),
+                    request_id=req_id,
                 )
                 continue
 
@@ -562,6 +696,7 @@ class QuillCacheV1Connector(KVConnectorBase_V1):
                     block_size=self._block_size,
                     is_store=False,
                     key_prefix=self._pd_prefix(self._disagg_load[req_id]),
+                    request_id=req_id,
                 )
                 total_need_load += 1
                 continue
@@ -576,6 +711,7 @@ class QuillCacheV1Connector(KVConnectorBase_V1):
                     block_size=self._block_size,
                     is_store=False,
                     key_prefix=self._content_prefix(prefix_hash),
+                    request_id=req_id,
                 )
                 total_need_load += 1
             elif not self._exists(self._manifest_key(self._content_prefix(prefix_hash))):
@@ -586,6 +722,7 @@ class QuillCacheV1Connector(KVConnectorBase_V1):
                     block_size=self._block_size,
                     is_store=True,
                     key_prefix=self._content_prefix(prefix_hash),
+                    request_id=req_id,
                 )
 
         cached_reqs = scheduler_output.scheduled_cached_reqs
@@ -613,6 +750,7 @@ class QuillCacheV1Connector(KVConnectorBase_V1):
                 block_size=self._block_size,
                 is_store=False,
                 key_prefix=key_prefix,
+                request_id=req_id,
             )
             total_need_load += 1
 

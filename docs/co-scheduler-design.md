@@ -186,8 +186,10 @@ The initial policy should be deliberately simple and measurable.
 - Add `/v1/transfer-telemetry` in the gateway so transfer adapters can report
   measured telemetry. `TransferObservation` prefers measured values and falls
   back to planner estimates when no measurement has arrived.
-- Remaining wiring: have the store/transfer adapter post these events
-  automatically and compare predicted-vs-actual TTFT.
+- Wire the real vLLM connector to post measured layer-load telemetry
+  automatically when `gateway_url` / `telemetry_url` is configured.
+- Remaining measurement work: compare predicted-vs-actual TTFT under real
+  traces and use the error to tune the cost model.
 - Add a dry-run controller that logs actions without applying them.
 
 Acceptance: static serving behavior is unchanged; `/v1/state` exposes the

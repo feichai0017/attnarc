@@ -132,6 +132,11 @@ co-scheduler needs: consumer-visible `time_to_first_layer_us`,
 ready. The first-layer timestamp is measured after the in-order reorder gate, so
 an out-of-order later layer cannot create a false early-start signal. Current
 gateway metrics accept these measurements through `/v1/transfer-telemetry` and
-prefer them over planner estimates in `TransferObservation`; the next wiring step
-is to make the store/transfer adapter post the events automatically during real
-KV movement.
+prefer them over planner estimates in `TransferObservation`.
+
+`bridge/quillcache_v1_connector.py` posts the same telemetry automatically during
+real vLLM KV loads when `gateway_url` or `telemetry_url` is configured. It records
+the first successful layer read as `time_to_first_layer_us`, the completion of
+all scheduled layer fetches as `full_transfer_us`, and reports the remaining
+overlap window without putting the serving path on the critical path: telemetry
+POSTs are best-effort and run on a small background executor.

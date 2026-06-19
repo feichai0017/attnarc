@@ -108,6 +108,8 @@ def run_e2e():
             "kv_role": "kv_both",
             "kv_connector_extra_config": {
                 "master_url": "http://127.0.0.1:7777",
+                "gateway_url": os.environ.get("QC_GATEWAY_URL"),
+                "engine_id": os.environ.get("QC_ENGINE_ID", "vllm-a"),
                 "segment_endpoints": {"seg-0": "127.0.0.1:8100"},
                 "tenant_id": "default",
                 "replica_num": 1,

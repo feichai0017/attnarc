@@ -132,11 +132,44 @@ curl -i http://127.0.0.1:8080/v1/chat/completions \
 The gateway strips the `quillcache` object before forwarding the request to the
 engine.
 
+## 7. Synthetic Transfer Telemetry Smoke Test
+
+When a real `QuillCacheV1Connector` is configured with `gateway_url` or
+`telemetry_url`, it posts measured layer-load telemetry to the gateway after each
+KV load. Without vLLM, the same metric path can be smoke-tested directly:
+
+```bash
+curl http://127.0.0.1:8080/v1/transfer-telemetry \
+  -H 'content-type: application/json' \
+  -d '{
+    "request_id": "demo-req",
+    "source_engine_id": "prefill-a",
+    "target_engine_id": "decode-a",
+    "backend": "quillcache-v1-connector",
+    "queue_depth": 4,
+    "telemetry": {
+      "layers": 4,
+      "bytes": 16777216,
+      "max_inflight": 1,
+      "time_to_first_layer_us": 12000,
+      "full_transfer_us": 42000,
+      "overlap_window_us": 30000
+    }
+  }'
+```
+
+Then inspect `transfer_telemetry`:
+
+```bash
+curl http://127.0.0.1:8080/v1/state | jq .transfer_telemetry
+```
+
 ## Current Limitations
 
 - Exact request-to-vLLM block matching requires client-provided block hints or a
   future tokenizer/block-hash sidecar.
-- The gateway consumes KV metadata only; it does not move KV tensors yet.
+- The gateway consumes KV metadata and transfer telemetry; tensor movement stays
+  in the vLLM connector + store/transfer-node data path.
 - The vLLM bridge depends on vLLM's Python event classes and should run in the
   same virtual environment as vLLM.
 - SGLang support is planned as a separate event adapter.

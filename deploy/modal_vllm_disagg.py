@@ -92,6 +92,8 @@ def run_disagg():
             "engine_id": engine_id,
             "kv_connector_extra_config": {
                 "master_url": "http://127.0.0.1:7777",
+                "gateway_url": os.environ.get("QC_GATEWAY_URL"),
+                "engine_id": engine_id,
                 "segment_endpoints": {"seg-0": "127.0.0.1:8100"},
                 "tenant_id": "default",
                 "replica_num": 1,
