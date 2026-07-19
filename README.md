@@ -34,9 +34,10 @@ never synchronously queries the global controller or Holt.
 The Rust lifecycle contracts, Holt catalog, planner, vLLM observer/delegate,
 output-plus-LSE merge, NCCL Route-Q harness, and generation-pinned FlashInfer
 paged-KV executor are implemented and covered by contract tests. The first
-two-L4 correctness/latency report is recorded under `docs/results`. A Mooncake
-adapter, cross-node transport, phase-level profiling, and broader hardware
-evaluation are not implemented yet. See the
+two-L4 correctness/latency report and a phase-instrumented 4K-32K prefix sweep
+are recorded under `docs/results`. A Mooncake adapter, cross-node transport,
+Nsight-level attribution, and broader hardware evaluation are not implemented
+yet. See the
 [implementation status](docs/status.md) for exact boundaries.
 
 ## Build

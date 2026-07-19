@@ -46,8 +46,8 @@ Exit: one real model decodes through the adapter with no remote execution.
 
 ### M2a: One-Node Route-Q Protocol
 
-Status: implementation complete and first Modal two-L4 report produced; broader
-hardware and workload sweep open.
+Status: implementation complete with a phase-instrumented Modal L4 4K-32K
+prefix sweep; real-model and topology-comparable hardware sweeps remain open.
 
 - place sealed prefix shards on a second GPU;
 - send Q through CUDA P2P or NCCL;
@@ -60,8 +60,8 @@ Exit: split execution matches the unsharded reference within dtype tolerance.
 
 ### M2b: Paged-KV Executor
 
-Status: executor and two-GPU correctness gate validated on Modal L4; external
-page-table binding and phase-level timing open.
+Status: executor, two-GPU correctness gate, and CUDA-event phase timing validated
+on Modal L4; external page-table binding and Nsight attribution remain open.
 
 - consume generation-pinned page tables without repacking contiguous KV;
 - reuse planned FlashInfer wrappers and workspaces across decode steps;

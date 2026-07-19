@@ -26,7 +26,7 @@ merge combines its attention state with the remote sealed-prefix state.
 | Rust runtime | `KvPool`, Holt catalog, planner, leases, generation-pinned `KvView`, transport handles | production pool and device transport adapters |
 | vLLM | local `CUSTOM` delegate and metadata observer | physical block to `PoolObjectRef` mapping and real-model GPU report |
 | Attention state | Rust reference, contiguous PyTorch/FlashInfer paths, and generation-pinned FlashInfer paged executor | external engine/pool page-table binding |
-| One-node data path | NCCL Route-Q and Stage-KV harness with contiguous and paged modes; Modal two-L4 report | phase-level timings and topology-comparable hardware sweep |
+| One-node data path | NCCL Route-Q and Stage-KV harness with contiguous and paged modes; phase-instrumented Modal L4 prefix sweep | Nsight attribution and topology-comparable bare-metal sweep |
 | Cross-node data path | contracts only | NIXL/UCX/GPUDirect RDMA implementation and measurements |
 
 The installable Python package lives under `python/src/loom_attention`, while
@@ -106,8 +106,22 @@ report is [modal-l4-4k-2026-07-19.json](results/modal-l4-4k-2026-07-19.json).
 This is one environment, not a general performance claim. That container
 reported `device_peer_access=false`, and gVisor denied the NVML topology query,
 so the result does not characterize NVLink, GPUDirect RDMA, or bare-metal PCIe.
-The report still lacks separate transfer, remote-kernel, local-tail, and merge
-timings.
+
+The phase-instrumented July 20 sweep added CUDA-event measurements for remote
+attention, local-tail attention, merge, and Stage-KV attention. It labels the
+end-to-end remainder as a communication/queue/framework residual rather than
+pure transfer time. Both ranks run the same fixed FP16 GEMM preconditioner before
+each timed path. For 4K/8K/16K/32K prefixes, Route-Q p50 was
+0.635/0.658/0.643/0.696 ms, while Stage-KV p50 grew nearly linearly at
+1.780/3.407/6.697/13.432 ms. A reverse-order run reproduced the trend within
+about 5% for Route-Q and 3% for Stage-KV. The complete reports are the
+[forward sweep](results/modal-l4-prefix-sweep-2026-07-20.json) and
+[reverse sweep](results/modal-l4-prefix-sweep-reverse-2026-07-20.json).
+
+Fine-grained local-tail and merge timings remain sensitive to runtime state.
+Mechanism-level attribution still requires a bare-metal Nsight trace. The
+current residual also combines NCCL transfer, queueing, synchronization, and
+framework overhead.
 
 ## Correctness Gate
 

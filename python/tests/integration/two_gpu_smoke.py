@@ -26,6 +26,8 @@ def _add_workload_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--kv-heads", type=int, default=8)
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--page-size", type=int, default=16)
+    parser.add_argument("--precondition-dimension", type=int, default=4096)
+    parser.add_argument("--precondition-iterations", type=int, default=100)
     parser.add_argument("--dtype", choices=sorted(DTYPE_BYTES), default="float16")
     parser.add_argument(
         "--attention-backend",
@@ -49,6 +51,8 @@ def _config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
         kv_heads=args.kv_heads,
         head_dim=args.head_dim,
         page_size=args.page_size,
+        precondition_dimension=args.precondition_dimension,
+        precondition_iterations=args.precondition_iterations,
         dtype=args.dtype,
         attention_backend=args.attention_backend,
         warmup=args.warmup,

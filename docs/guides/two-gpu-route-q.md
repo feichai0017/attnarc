@@ -94,6 +94,11 @@ python3 -m integration.two_gpu_smoke run \
 Repeat at 4K, 8K, 16K, 32K, and the largest feasible prefix. Keep every other
 argument fixed when comparing the two paths.
 
+By default, both ranks execute a fixed 100-by-4096 FP16 GEMM preconditioner
+before each timed path. This work is excluded from latency samples and controls
+for accelerator clock state. Set `--precondition-iterations 0` to disable it,
+and record that choice when comparing reports.
+
 ## Run On Modal
 
 With a configured Modal profile, run the same gate on two co-located L4 GPUs:
@@ -103,6 +108,16 @@ uvx --from modal modal run python/tests/integration/modal_two_gpu.py \
   --prefix-tokens 4096 \
   --iterations 100 \
   --report build/modal/two-gpu-l4.json
+```
+
+Run a prefix sweep in one allocated container with:
+
+```bash
+uvx --from modal modal run python/tests/integration/modal_two_gpu.py \
+  --prefix-sweep 4096,8192,16384,32768 \
+  --warmup 10 \
+  --iterations 100 \
+  --report build/modal/two-gpu-l4-prefix-sweep.json
 ```
 
 The function uses an ephemeral `L4:2` container and shuts down after writing the
@@ -159,6 +174,7 @@ A reviewable report must contain:
 - peer-access capability;
 - complete workload configuration;
 - p50/p99 latency and payload bytes for both paths;
+- CUDA-event kernel timings and the explicitly labelled non-kernel residual;
 - explicit kernel, KV layout, paged-executor, and fixture-repack metadata.
 
 The macOS development host cannot produce this report locally. The first Linux
@@ -177,3 +193,53 @@ remote prefix pages, while Stage-KV receives directly into page storage. The
 fixture is paged once before warmup because the deterministic input generator
 starts from contiguous tensors; this is not evidence of an external-pool
 zero-copy page-table bridge.
+
+## Phase Timing Boundary
+
+End-to-end latency uses a host monotonic clock bracketed by CUDA
+synchronization. Remote attention, local-tail attention, merge, and Stage-KV
+attention use CUDA events on their owning rank. Rank 1 sends its event durations
+to rank 0 only after the measured Route-Q loop.
+
+The report derives `communication_queue_framework_residual_ms` per sample by
+subtracting measured kernel durations from end-to-end latency. The residual
+includes NCCL transport, queueing, stream synchronization, Python/PyTorch
+overhead, and measurement overhead. It is deliberately not named transfer time
+and must not be used as a pure link-bandwidth result.
+
+## Modal L4 Prefix Sweep
+
+The July 20 sweep used two L4 GPUs, FP16, one decode row, a 16-token local tail,
+10 workload warmups, 100 measured iterations, and the default GPU
+preconditioner. All Route-Q and Stage-KV outputs passed the independent
+full-attention oracle at `atol=rtol=2e-3`.
+
+| Prefix | Route-Q p50 / p99 | Stage-KV p50 / p99 | Stage / Route p50 |
+| ---: | ---: | ---: | ---: |
+| 4K | 0.635 / 1.094 ms | 1.780 / 2.004 ms | 2.80x |
+| 8K | 0.658 / 1.516 ms | 3.407 / 3.534 ms | 5.17x |
+| 16K | 0.643 / 1.143 ms | 6.697 / 6.749 ms | 10.42x |
+| 32K | 0.696 / 0.920 ms | 13.432 / 13.598 ms | 19.29x |
+
+Stage-KV's payload divided by end-to-end p50 is about 9.4-10.0 GB/s across
+the sweep, so its latency tracks KV bytes. This is effective application-level
+payload throughput, not raw NCCL bandwidth. Route-Q always transfers 16,512
+bytes. At 32K, its remote-attention kernel reached 0.552 ms p50 while the
+communication/queue/framework residual was 0.125 ms p50, showing that the next
+Route-Q optimization target has shifted toward attention execution rather than
+moving the Q/output state.
+
+A reverse-order sweep reproduced the endpoint trend: Stage-KV p50 differed by
+0.2%-2.9% and Route-Q p50 by about 1%-5% at matching lengths. Fine-grained
+local-tail and merge event timings varied with workload/runtime state even
+after fixed preconditioning. They remain diagnostic observations until a
+bare-metal Nsight trace can attribute streams, clocks, and allocator effects.
+
+Raw reports:
+
+- [forward sweep](../results/modal-l4-prefix-sweep-2026-07-20.json)
+- [reverse sweep](../results/modal-l4-prefix-sweep-reverse-2026-07-20.json)
+
+The Modal environment reported no CUDA peer access and blocked the NVML topology
+query under gVisor. These results do not characterize NVLink, GPUDirect RDMA, or
+bare-metal PCIe.

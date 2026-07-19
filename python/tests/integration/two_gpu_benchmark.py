@@ -47,6 +47,8 @@ class BenchmarkConfig:
     dtype: str = "float16"
     attention_backend: str = "reference"
     page_size: int = 16
+    precondition_dimension: int = 4096
+    precondition_iterations: int = 100
     warmup: int = 5
     iterations: int = 20
     seed: int = 7
@@ -70,14 +72,22 @@ class BenchmarkConfig:
             "kv_heads": self.kv_heads,
             "head_dim": self.head_dim,
             "page_size": self.page_size,
+            "precondition_dimension": self.precondition_dimension,
             "iterations": self.iterations,
             "timeout_seconds": self.timeout_seconds,
         }
         invalid = [name for name, value in positive.items() if value <= 0]
         if invalid:
             raise ValueError(f"values must be positive: {', '.join(invalid)}")
-        if self.tail_tokens < 0 or self.warmup < 0:
-            raise ValueError("tail_tokens and warmup must be non-negative")
+        if (
+            self.tail_tokens < 0
+            or self.precondition_iterations < 0
+            or self.warmup < 0
+        ):
+            raise ValueError(
+                "tail_tokens, precondition_iterations, and warmup must be "
+                "non-negative"
+            )
         if self.query_heads % self.kv_heads != 0:
             raise ValueError("kv_heads must divide query_heads")
         if self.dtype not in DTYPE_BYTES:
@@ -138,6 +148,48 @@ def _latency_summary(samples: Sequence[float]) -> dict[str, float]:
         "min_ms": float(min(samples)),
         "max_ms": float(max(samples)),
     }
+
+
+def _optional_latency_summary(
+    samples: Sequence[float],
+) -> dict[str, float] | None:
+    return _latency_summary(samples) if samples else None
+
+
+def _residual_samples(
+    totals: Sequence[float], *components: Sequence[float]
+) -> list[float]:
+    """Return the non-kernel residual without claiming it is pure transport."""
+    for component in components:
+        if len(component) != len(totals):
+            raise ValueError("phase sample counts must match end-to-end samples")
+    return [
+        max(0.0, total - sum(component[index] for component in components))
+        for index, total in enumerate(totals)
+    ]
+
+
+def _record_cuda_interval(
+    torch: Any,
+    operation: Any,
+    intervals: list[tuple[Any, Any]] | None,
+) -> Any:
+    if intervals is None:
+        return operation()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    result = operation()
+    end.record()
+    intervals.append((start, end))
+    return result
+
+
+def _cuda_event_samples(
+    torch: Any, intervals: Sequence[tuple[Any, Any]]
+) -> list[float]:
+    torch.cuda.synchronize()
+    return [float(start.elapsed_time(end)) for start, end in intervals]
 
 
 def _torch_dtype(torch: Any, name: str) -> Any:
@@ -255,6 +307,8 @@ def _route_engine(
     remote_buffers: tuple[Any, Any],
     local_tail: tuple[Any, Any],
     config: BenchmarkConfig,
+    local_tail_intervals: list[tuple[Any, Any]] | None = None,
+    merge_intervals: list[tuple[Any, Any]] | None = None,
 ) -> Any:
     state_backend = _state_backend(config)
     dist.send(query, dst=1)
@@ -262,17 +316,25 @@ def _route_engine(
     states = [remote_buffers]
     if config.tail_tokens:
         states.append(
-            compute_attention_state(
+            _record_cuda_interval(
                 torch,
-                query,
-                local_tail[0],
-                local_tail[1],
-                kv_heads=config.kv_heads,
-                scale=config.head_dim**-0.5,
-                backend=state_backend,
+                lambda: compute_attention_state(
+                    torch,
+                    query,
+                    local_tail[0],
+                    local_tail[1],
+                    kv_heads=config.kv_heads,
+                    scale=config.head_dim**-0.5,
+                    backend=state_backend,
+                ),
+                local_tail_intervals,
             )
         )
-    return merge_attention_states(torch, states, backend=state_backend)[0]
+    return _record_cuda_interval(
+        torch,
+        lambda: merge_attention_states(torch, states, backend=state_backend),
+        merge_intervals,
+    )[0]
 
 
 def _route_worker(
@@ -282,18 +344,20 @@ def _route_worker(
     prefix: tuple[Any, Any],
     config: BenchmarkConfig,
     paged: _PagedFixture | None,
+    attention_intervals: list[tuple[Any, Any]] | None = None,
 ) -> None:
     dist.recv(query_buffer, src=0)
-    if paged is not None:
-        state = paged.executor.execute(
-            query_buffer,
-            paged.cache,
-            paged.view,
-            kv_heads=config.kv_heads,
-            scale=config.head_dim**-0.5,
-        )
-    else:
-        state = compute_attention_state(
+
+    def compute_remote_state() -> tuple[Any, Any]:
+        if paged is not None:
+            return paged.executor.execute(
+                query_buffer,
+                paged.cache,
+                paged.view,
+                kv_heads=config.kv_heads,
+                scale=config.head_dim**-0.5,
+            )
+        return compute_attention_state(
             torch,
             query_buffer,
             prefix[0],
@@ -302,6 +366,10 @@ def _route_worker(
             scale=config.head_dim**-0.5,
             backend=config.attention_backend,
         )
+
+    state = _record_cuda_interval(
+        torch, compute_remote_state, attention_intervals
+    )
     _batch_send(dist, state, destination=0)
 
 
@@ -313,24 +381,31 @@ def _stage_engine(
     full_buffers: tuple[Any, Any],
     config: BenchmarkConfig,
     paged: _PagedFixture | None,
+    attention_intervals: list[tuple[Any, Any]] | None = None,
 ) -> Any:
     _batch_receive(dist, receive_buffers, source=1)
-    if paged is not None:
-        return paged.executor.execute(
+
+    def compute_full_state() -> tuple[Any, Any]:
+        if paged is not None:
+            return paged.executor.execute(
+                query,
+                paged.cache,
+                paged.view,
+                kv_heads=config.kv_heads,
+                scale=config.head_dim**-0.5,
+            )
+        return compute_attention_state(
+            torch,
             query,
-            paged.cache,
-            paged.view,
+            full_buffers[0],
+            full_buffers[1],
             kv_heads=config.kv_heads,
             scale=config.head_dim**-0.5,
-        )[0]
-    return compute_attention_state(
-        torch,
-        query,
-        full_buffers[0],
-        full_buffers[1],
-        kv_heads=config.kv_heads,
-        scale=config.head_dim**-0.5,
-        backend=_state_backend(config),
+            backend=_state_backend(config),
+        )
+
+    return _record_cuda_interval(
+        torch, compute_full_state, attention_intervals
     )[0]
 
 
@@ -369,6 +444,25 @@ def _timed_cuda(torch: Any, operation: Any) -> float:
     return (perf_counter() - started) * 1_000.0
 
 
+def _precondition_cuda(torch: Any, config: BenchmarkConfig, device: Any) -> None:
+    """Bring both GPUs to an active clock state outside measured regions."""
+    if config.precondition_iterations == 0:
+        return
+    dimension = config.precondition_dimension
+    scale = dimension**-0.5
+    left = torch.randn(
+        (dimension, dimension),
+        dtype=torch.float16,
+        device=device,
+    ).mul_(scale)
+    right = torch.randn_like(left).mul_(scale)
+    output = torch.empty_like(left)
+    for _ in range(config.precondition_iterations):
+        torch.mm(left, right, out=output)
+        left, output = output, left
+    torch.cuda.synchronize()
+
+
 def _environment(torch: Any) -> dict[str, Any]:
     devices = []
     for index in range(2):
@@ -404,6 +498,10 @@ def _write_report(
     expected: Any,
     route_samples: Sequence[float],
     stage_samples: Sequence[float],
+    route_remote_attention_samples: Sequence[float],
+    route_local_tail_samples: Sequence[float],
+    route_merge_samples: Sequence[float],
+    stage_attention_samples: Sequence[float],
     report_path: str,
 ) -> None:
     paged = config.attention_backend == PAGED_ATTENTION_BACKEND
@@ -427,8 +525,20 @@ def _write_report(
     stage = _latency_summary(stage_samples)
     route["payload_bytes"] = projected_transfer_bytes(config)["route_query_total"]
     stage["payload_bytes"] = projected_transfer_bytes(config)["stage_kv_total"]
+    local_tail_for_residual = route_local_tail_samples or [
+        0.0 for _ in route_samples
+    ]
+    route_residual = _residual_samples(
+        route_samples,
+        route_remote_attention_samples,
+        local_tail_for_residual,
+        route_merge_samples,
+    )
+    stage_residual = _residual_samples(
+        stage_samples, stage_attention_samples
+    )
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "passed": passed,
         "implementation": {
@@ -461,6 +571,46 @@ def _write_report(
         },
         "route_query": route,
         "stage_kv": stage,
+        "phase_breakdown": {
+            "measurement": {
+                "end_to_end_clock": (
+                    "host perf_counter bracketed by CUDA synchronization"
+                ),
+                "kernel_clock": "CUDA events on each rank's current stream",
+                "residual_definition": (
+                    "end-to-end minus measured CUDA kernels; includes NCCL "
+                    "transport, queueing, synchronization, and host/framework "
+                    "overhead, so it is not a pure link-bandwidth measurement"
+                ),
+                "profiling_metadata_exchange": (
+                    "rank-1 event durations sent after the timed Route-Q loop"
+                ),
+                "gpu_preconditioning": (
+                    "fixed FP16 GEMM loop on both ranks before each timed path; "
+                    "excluded from end-to-end samples"
+                ),
+            },
+            "route_query": {
+                "remote_attention_kernel_ms": _latency_summary(
+                    route_remote_attention_samples
+                ),
+                "local_tail_kernel_ms": _optional_latency_summary(
+                    route_local_tail_samples
+                ),
+                "merge_kernel_ms": _latency_summary(route_merge_samples),
+                "communication_queue_framework_residual_ms": _latency_summary(
+                    route_residual
+                ),
+            },
+            "stage_kv": {
+                "attention_kernel_ms": _latency_summary(
+                    stage_attention_samples
+                ),
+                "communication_queue_framework_residual_ms": _latency_summary(
+                    stage_residual
+                ),
+            },
+        },
         "stage_over_route_p50": stage["p50_ms"] / route["p50_ms"],
     }
     path = Path(report_path)
@@ -551,6 +701,11 @@ def _run_rank(
                     table_id="route/prefix/layer-0",
                 )
 
+        route_remote_attention_intervals: list[tuple[Any, Any]] = []
+        route_local_tail_intervals: list[tuple[Any, Any]] = []
+        route_merge_intervals: list[tuple[Any, Any]] = []
+        stage_attention_intervals: list[tuple[Any, Any]] = []
+
         dist.barrier()
         if rank == 0:
             route_output = _route_engine(
@@ -561,22 +716,63 @@ def _run_rank(
             _route_worker(torch, dist, query_buffer, prefix, config, paged_route)
 
         dist.barrier()
+        _precondition_cuda(torch, config, device)
+        dist.barrier()
         route_samples = []
         for iteration in range(config.warmup + config.iterations):
+            measured = iteration >= config.warmup
             if rank == 0:
                 elapsed = _timed_cuda(
                     torch,
                     lambda: _route_engine(
-                        torch, dist, query, remote_buffers, local_tail, config
+                        torch,
+                        dist,
+                        query,
+                        remote_buffers,
+                        local_tail,
+                        config,
+                        (
+                            route_local_tail_intervals
+                            if measured
+                            else None
+                        ),
+                        route_merge_intervals if measured else None,
                     ),
                 )
-                if iteration >= config.warmup:
+                if measured:
                     route_samples.append(elapsed)
             else:
                 _route_worker(
-                    torch, dist, query_buffer, prefix, config, paged_route
+                    torch,
+                    dist,
+                    query_buffer,
+                    prefix,
+                    config,
+                    paged_route,
+                    route_remote_attention_intervals if measured else None,
                 )
 
+        dist.barrier()
+        if rank == 0:
+            remote_attention_tensor = torch.empty(
+                config.iterations, dtype=torch.float64, device=device
+            )
+            dist.recv(remote_attention_tensor, src=1)
+            route_remote_attention_samples = (
+                remote_attention_tensor.cpu().tolist()
+            )
+        else:
+            route_remote_attention_samples = _cuda_event_samples(
+                torch, route_remote_attention_intervals
+            )
+            dist.send(
+                torch.tensor(
+                    route_remote_attention_samples,
+                    dtype=torch.float64,
+                    device=device,
+                ),
+                dst=0,
+            )
         dist.barrier()
         if rank == 0:
             stage_output = _stage_engine(
@@ -592,8 +788,11 @@ def _run_rank(
             _stage_worker(dist, prefix)
 
         dist.barrier()
+        _precondition_cuda(torch, config, device)
+        dist.barrier()
         stage_samples = []
         for iteration in range(config.warmup + config.iterations):
+            measured = iteration >= config.warmup
             if rank == 0:
                 elapsed = _timed_cuda(
                     torch,
@@ -605,15 +804,25 @@ def _run_rank(
                         stage_full_buffers,
                         config,
                         paged_stage,
+                        stage_attention_intervals if measured else None,
                     ),
                 )
-                if iteration >= config.warmup:
+                if measured:
                     stage_samples.append(elapsed)
             else:
                 _stage_worker(dist, prefix)
 
         dist.barrier()
         if rank == 0:
+            route_local_tail_samples = _cuda_event_samples(
+                torch, route_local_tail_intervals
+            )
+            route_merge_samples = _cuda_event_samples(
+                torch, route_merge_intervals
+            )
+            stage_attention_samples = _cuda_event_samples(
+                torch, stage_attention_intervals
+            )
             _write_report(
                 torch,
                 config,
@@ -622,6 +831,10 @@ def _run_rank(
                 expected,
                 route_samples,
                 stage_samples,
+                route_remote_attention_samples,
+                route_local_tail_samples,
+                route_merge_samples,
+                stage_attention_samples,
                 report_path,
             )
     finally:

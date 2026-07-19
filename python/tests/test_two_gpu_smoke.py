@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from integration.two_gpu_benchmark import (
     BenchmarkConfig,
+    _residual_samples,
     percentile,
     projected_transfer_bytes,
 )
@@ -38,6 +39,12 @@ class TwoGpuSmokeContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported attention backend"):
             BenchmarkConfig(attention_backend="unknown").validate()
 
+    def test_rejects_invalid_precondition_configuration(self) -> None:
+        with self.assertRaisesRegex(ValueError, "values must be positive"):
+            BenchmarkConfig(precondition_dimension=0).validate()
+        with self.assertRaisesRegex(ValueError, "must be non-negative"):
+            BenchmarkConfig(precondition_iterations=-1).validate()
+
     def test_accepts_paged_flashinfer_backend(self) -> None:
         config = BenchmarkConfig(
             attention_backend="flashinfer-paged", page_size=32
@@ -54,6 +61,17 @@ class TwoGpuSmokeContractTest(unittest.TestCase):
     def test_percentile_interpolates_ordered_samples(self) -> None:
         self.assertEqual(percentile([4.0, 1.0, 3.0, 2.0], 0.5), 2.5)
         self.assertAlmostEqual(percentile([1.0, 2.0, 3.0], 0.99), 2.98)
+
+    def test_phase_residual_subtracts_kernels_and_clamps_noise(self) -> None:
+        residual = _residual_samples(
+            [1.0, 2.0], [0.2, 1.8], [0.3, 0.3]
+        )
+        self.assertAlmostEqual(residual[0], 0.5)
+        self.assertEqual(residual[1], 0.0)
+
+    def test_phase_residual_rejects_mismatched_sample_counts(self) -> None:
+        with self.assertRaisesRegex(ValueError, "sample counts must match"):
+            _residual_samples([1.0, 2.0], [0.2])
 
     def test_plan_command_does_not_import_torch(self) -> None:
         output = io.StringIO()

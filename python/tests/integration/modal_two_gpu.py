@@ -43,14 +43,7 @@ image = (
 app = modal.App("loom-two-gpu-gate")
 
 
-@app.function(
-    image=image,
-    gpu="L4:2",
-    cpu=4,
-    memory=16_384,
-    timeout=30 * 60,
-)
-def run_gate(
+def _run_gate_process(
     prefix_tokens: int,
     tail_tokens: int,
     rows: int,
@@ -62,7 +55,7 @@ def run_gate(
     warmup: int,
     iterations: int,
 ) -> dict[str, Any]:
-    report_path = Path("/tmp/loom-two-gpu-report.json")
+    report_path = Path(f"/tmp/loom-two-gpu-{prefix_tokens}-report.json")
     command = [
         sys.executable,
         "-m",
@@ -161,21 +154,26 @@ def run_gate(
     return report
 
 
-@app.local_entrypoint()
-def main(
-    prefix_tokens: int = 4096,
-    tail_tokens: int = 16,
-    rows: int = 1,
-    query_heads: int = 32,
-    kv_heads: int = 8,
-    head_dim: int = 128,
-    dtype: str = "float16",
-    page_size: int = 16,
-    warmup: int = 10,
-    iterations: int = 100,
-    report: str = "build/modal/two-gpu-l4.json",
-) -> None:
-    result = run_gate.remote(
+@app.function(
+    image=image,
+    gpu="L4:2",
+    cpu=4,
+    memory=16_384,
+    timeout=30 * 60,
+)
+def run_gate(
+    prefix_tokens: int,
+    tail_tokens: int,
+    rows: int,
+    query_heads: int,
+    kv_heads: int,
+    head_dim: int,
+    dtype: str,
+    page_size: int,
+    warmup: int,
+    iterations: int,
+) -> dict[str, Any]:
+    return _run_gate_process(
         prefix_tokens,
         tail_tokens,
         rows,
@@ -187,13 +185,115 @@ def main(
         warmup,
         iterations,
     )
+
+
+@app.function(
+    image=image,
+    gpu="L4:2",
+    cpu=4,
+    memory=16_384,
+    timeout=30 * 60,
+)
+def run_sweep(
+    prefix_tokens: list[int],
+    tail_tokens: int,
+    rows: int,
+    query_heads: int,
+    kv_heads: int,
+    head_dim: int,
+    dtype: str,
+    page_size: int,
+    warmup: int,
+    iterations: int,
+) -> list[dict[str, Any]]:
+    return [
+        _run_gate_process(
+            prefix_length,
+            tail_tokens,
+            rows,
+            query_heads,
+            kv_heads,
+            head_dim,
+            dtype,
+            page_size,
+            warmup,
+            iterations,
+        )
+        for prefix_length in prefix_tokens
+    ]
+
+
+@app.local_entrypoint()
+def main(
+    prefix_tokens: int = 4096,
+    prefix_sweep: str = "",
+    tail_tokens: int = 16,
+    rows: int = 1,
+    query_heads: int = 32,
+    kv_heads: int = 8,
+    head_dim: int = 128,
+    dtype: str = "float16",
+    page_size: int = 16,
+    warmup: int = 10,
+    iterations: int = 100,
+    report: str = "build/modal/two-gpu-l4.json",
+) -> None:
+    if prefix_sweep:
+        prefixes = [
+            int(value.strip())
+            for value in prefix_sweep.split(",")
+            if value.strip()
+        ]
+        if not prefixes:
+            raise ValueError("prefix_sweep must contain at least one integer")
+        reports = run_sweep.remote(
+            prefixes,
+            tail_tokens,
+            rows,
+            query_heads,
+            kv_heads,
+            head_dim,
+            dtype,
+            page_size,
+            warmup,
+            iterations,
+        )
+        result: dict[str, Any] = {
+            "schema_version": 1,
+            "sweep_variable": "prefix_tokens",
+            "prefix_tokens": prefixes,
+            "passed": all(item["passed"] for item in reports),
+            "reports": reports,
+        }
+    else:
+        result = run_gate.remote(
+            prefix_tokens,
+            tail_tokens,
+            rows,
+            query_heads,
+            kv_heads,
+            head_dim,
+            dtype,
+            page_size,
+            warmup,
+            iterations,
+        )
     output = Path(report)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     print(f"report={output}")
     print(f"passed={result['passed']}")
-    print(f"route_query_p50_ms={result['route_query']['p50_ms']:.3f}")
-    print(f"stage_kv_p50_ms={result['stage_kv']['p50_ms']:.3f}")
+    if prefix_sweep:
+        for item in result["reports"]:
+            prefix_length = item["workload"]["prefix_tokens"]
+            print(
+                f"prefix_tokens={prefix_length} "
+                f"route_query_p50_ms={item['route_query']['p50_ms']:.3f} "
+                f"stage_kv_p50_ms={item['stage_kv']['p50_ms']:.3f}"
+            )
+    else:
+        print(f"route_query_p50_ms={result['route_query']['p50_ms']:.3f}")
+        print(f"stage_kv_p50_ms={result['stage_kv']['p50_ms']:.3f}")
 
 
 if __name__ == "__main__":
