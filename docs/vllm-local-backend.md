@@ -88,6 +88,41 @@ device tensor descriptors.
 
 CI tests registration, forwarding, metadata building, block-table replacement,
 zero device readback, layout rejection, error propagation, and plugin
-idempotence with fake tensor and vLLM modules. A real vLLM installation, CUDA
-device, model decode, output-equality check, and performance measurement are
-still required before M1 can be declared complete.
+idempotence with fake tensor and vLLM modules.
+
+## CUDA Acceptance Gate
+
+The repository includes `quillcache-vllm-smoke`, but the result is valid only
+when it runs on a Linux NVIDIA host. Install the adapter and pinned vLLM range in
+the same Python 3.10-3.12 environment:
+
+```bash
+python3 -m pip install -e './python[vllm]'
+quillcache-vllm-smoke compare \
+  --report build/vllm-smoke/report.json
+```
+
+The default workload uses the public, revision-pinned
+`HuggingFaceTB/SmolLM2-135M-Instruct` Llama model. The harness starts two clean
+processes with identical model, dtype, prompts, seed, block size, eager mode,
+and prefix-caching settings:
+
+1. native vLLM `FLASH_ATTN`;
+2. QuillCache `CUSTOM`, which delegates to the same implementation.
+
+It disables V1 multiprocessing for deterministic same-process execution, warms
+each engine, and checks every generated token ID and sampled token logprob.
+Token IDs must match exactly; logprobs default to an absolute tolerance of
+`1e-5`. Startup and median generation times are recorded, but timing does not
+affect pass/fail because this small sequential smoke workload is not a
+performance benchmark.
+
+Exit status `0` means the correctness comparison passed, `1` means outputs
+differed, and `2` means the environment or runtime contract failed. The JSON
+report retains both raw runs and all differences. A report must include the GPU,
+vLLM version, model revision, and workload settings to be reviewable.
+
+The current macOS development host has no CUDA runtime, so the CUDA gate has not
+yet run. M1 remains incomplete until a real report is produced. Even after it
+passes, physical vLLM block IDs still need to be joined with external
+`PoolObjectRef` values and installed in the Rust node runtime.

@@ -46,6 +46,8 @@ never synchronously queries the gateway or Holt.
   unchanged execution to vLLM FlashAttention;
 - vLLM metadata-builder wrapper that records generation-checked paged-KV tensor
   descriptors without reading device tensor contents.
+- isolated CUDA A/B harness that compares native FlashAttention with the
+  QuillCache delegate using exact token IDs and sampled-logprob tolerance.
 
 ## Not Implemented Yet
 
@@ -62,6 +64,12 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 PYTHONPATH=python python3 -m unittest discover -s python/tests -v
+```
+
+On a Linux CUDA host with vLLM installed, run the M1 acceptance gate:
+
+```bash
+quillcache-vllm-smoke compare --report build/vllm-smoke/report.json
 ```
 
 Run the control endpoints:

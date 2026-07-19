@@ -16,6 +16,9 @@ vllm = ["vllm>=0.25,<0.26"]
 [project.entry-points."vllm.general_plugins"]
 quillcache = "quillcache_engine.vllm_plugin:register"
 
+[project.scripts]
+quillcache-vllm-smoke = "quillcache_engine.vllm_smoke:main"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["quillcache_engine*"]

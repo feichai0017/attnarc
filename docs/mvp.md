@@ -26,8 +26,13 @@ tensor values are never copied to CPU by this observer.
 
 The current adapter does not map vLLM physical block IDs to external
 `PoolObjectRef` values or install the snapshot in the Rust runtime yet, and it
-has not decoded a real model. Those remain M1 exit conditions. Remote attention
-and split-KV execution begin at M2.
+has not decoded a real model. The `quillcache-vllm-smoke` command is the GPU
+acceptance harness: it runs native and delegated backends in isolated processes,
+requires exact generated token equality, checks sampled logprobs within a fixed
+tolerance, and writes a hardware/version-qualified JSON report. The harness is
+implemented, but no CUDA report has been produced on the current macOS host.
+Those remain M1 exit conditions. Remote attention and split-KV execution begin
+at M2.
 
 ## Correctness Gate
 
