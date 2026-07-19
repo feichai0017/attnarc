@@ -29,8 +29,9 @@ merge combines its attention state with the remote sealed-prefix state.
 | One-node data path | NCCL Route-Q and Stage-KV benchmark harness | executed two-GPU hardware report |
 | Cross-node data path | contracts only | NIXL/UCX/GPUDirect RDMA implementation and measurements |
 
-The Python package keeps reusable kernels in `attention_state.py`, benchmark
-execution in `two_gpu_benchmark.py`, and command-line handling in
+The Python package lives under `python/src/loom_attention`, while tests live
+under `python/tests`. Reusable kernels are in `attention_state.py`, benchmark
+execution is in `two_gpu_benchmark.py`, and command-line handling is in
 `two_gpu_smoke.py`. Engine integration remains in the `vllm_*`,
 `local_delegate`, and `step_metadata` modules.
 

@@ -23,5 +23,5 @@ loom-vllm-smoke = "loom_attention.vllm_smoke:main"
 loom-two-gpu-smoke = "loom_attention.two_gpu_smoke:main"
 
 [tool.setuptools.packages.find]
-where = ["."]
+where = ["src"]
 include = ["loom_attention*"]

@@ -25,7 +25,8 @@ never synchronously queries the global controller or Holt.
 | `crates/loom-attention` | one Rust package with runtime, pool, catalog, planner, transport, and attention modules |
 | `loom-control` | slow-path catalog/scheduler binary from the `loom-attention` package |
 | `loom-worker` | attention-worker control binary from the `loom-attention` package |
-| `python/loom_attention` | vLLM adapters, attention-state executors, and GPU acceptance harnesses |
+| `python/src/loom_attention` | installable vLLM adapters, attention-state executors, and GPU harnesses |
+| `python/tests` | Python unit and adapter contract tests |
 
 ## Current Status
 
@@ -42,7 +43,7 @@ performance report are not implemented yet. See the
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-PYTHONPATH=python python3 -m unittest discover -s python/tests -v
+PYTHONPATH=python/src python3 -m unittest discover -s python/tests -v
 ```
 
 On a Linux CUDA host with vLLM installed, run the M1 acceptance gate:
