@@ -9,9 +9,8 @@ from pathlib import Path
 import sys
 from typing import Sequence
 
-from loom_attention.attention_state import ATTENTION_BACKENDS
-
 from .two_gpu_benchmark import (
+    BENCHMARK_ATTENTION_BACKENDS,
     DTYPE_BYTES,
     BenchmarkConfig,
     projected_transfer_bytes,
@@ -26,10 +25,11 @@ def _add_workload_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--query-heads", type=int, default=32)
     parser.add_argument("--kv-heads", type=int, default=8)
     parser.add_argument("--head-dim", type=int, default=128)
+    parser.add_argument("--page-size", type=int, default=16)
     parser.add_argument("--dtype", choices=sorted(DTYPE_BYTES), default="float16")
     parser.add_argument(
         "--attention-backend",
-        choices=ATTENTION_BACKENDS,
+        choices=BENCHMARK_ATTENTION_BACKENDS,
         default="reference",
     )
     parser.add_argument("--warmup", type=int, default=5)
@@ -48,6 +48,7 @@ def _config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
         query_heads=args.query_heads,
         kv_heads=args.kv_heads,
         head_dim=args.head_dim,
+        page_size=args.page_size,
         dtype=args.dtype,
         attention_backend=args.attention_backend,
         warmup=args.warmup,

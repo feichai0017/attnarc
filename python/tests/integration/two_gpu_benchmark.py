@@ -24,9 +24,12 @@ from loom_attention.attention_state import (
     compute_attention_state,
     merge_attention_states,
 )
+from loom_attention.paged_executor import FlashInferPagedExecutor, PagedKvView
 
 
 DTYPE_BYTES = {"float16": 2, "bfloat16": 2}
+PAGED_ATTENTION_BACKEND = "flashinfer-paged"
+BENCHMARK_ATTENTION_BACKENDS = (*ATTENTION_BACKENDS, PAGED_ATTENTION_BACKEND)
 DTYPE_TOLERANCES = {
     "float16": (2e-3, 2e-3),
     "bfloat16": (2e-2, 2e-2),
@@ -43,6 +46,7 @@ class BenchmarkConfig:
     head_dim: int = 128
     dtype: str = "float16"
     attention_backend: str = "reference"
+    page_size: int = 16
     warmup: int = 5
     iterations: int = 20
     seed: int = 7
@@ -65,6 +69,7 @@ class BenchmarkConfig:
             "query_heads": self.query_heads,
             "kv_heads": self.kv_heads,
             "head_dim": self.head_dim,
+            "page_size": self.page_size,
             "iterations": self.iterations,
             "timeout_seconds": self.timeout_seconds,
         }
@@ -77,7 +82,7 @@ class BenchmarkConfig:
             raise ValueError("kv_heads must divide query_heads")
         if self.dtype not in DTYPE_BYTES:
             raise ValueError(f"unsupported dtype: {self.dtype}")
-        if self.attention_backend not in ATTENTION_BACKENDS:
+        if self.attention_backend not in BENCHMARK_ATTENTION_BACKENDS:
             raise ValueError(
                 f"unsupported attention backend: {self.attention_backend}"
             )
@@ -160,6 +165,77 @@ def _make_inputs(torch: Any, config: BenchmarkConfig, device: Any) -> tuple[Any,
     return query, prefix_key, prefix_value, tail_key, tail_value
 
 
+@dataclass(frozen=True)
+class _PagedFixture:
+    executor: FlashInferPagedExecutor
+    cache: tuple[Any, Any]
+    view: PagedKvView
+
+
+def _make_paged_fixture(
+    torch: Any,
+    key: Any,
+    value: Any,
+    config: BenchmarkConfig,
+    *,
+    table_id: str,
+) -> _PagedFixture:
+    """Build a benchmark fixture once; timed execution consumes pages directly."""
+    token_count = key.shape[0]
+    page_count = math.ceil(token_count / config.page_size)
+    page_shape = (
+        page_count,
+        config.page_size,
+        config.kv_heads,
+        config.head_dim,
+    )
+    paged_key = torch.zeros(page_shape, dtype=key.dtype, device=key.device)
+    paged_value = torch.zeros_like(paged_key)
+    paged_key.view(-1, config.kv_heads, config.head_dim)[:token_count].copy_(key)
+    paged_value.view(-1, config.kv_heads, config.head_dim)[:token_count].copy_(
+        value
+    )
+
+    indices = torch.arange(
+        page_count, dtype=torch.int32, device=key.device
+    ).repeat(config.rows)
+    indptr = torch.arange(
+        0,
+        (config.rows + 1) * page_count,
+        page_count,
+        dtype=torch.int32,
+        device=key.device,
+    )
+    last_page_len = token_count % config.page_size or config.page_size
+    last_page_lens = torch.full(
+        (config.rows,),
+        last_page_len,
+        dtype=torch.int32,
+        device=key.device,
+    )
+    view = PagedKvView(
+        table_id=table_id,
+        page_table_generation=1,
+        lease_ids=(f"benchmark:{table_id}",),
+        indptr=indptr,
+        indices=indices,
+        last_page_len=last_page_lens,
+        page_size=config.page_size,
+        layout="NHD",
+    )
+    return _PagedFixture(
+        executor=FlashInferPagedExecutor(),
+        cache=(paged_key, paged_value),
+        view=view,
+    )
+
+
+def _state_backend(config: BenchmarkConfig) -> str:
+    if config.attention_backend == PAGED_ATTENTION_BACKEND:
+        return "flashinfer"
+    return config.attention_backend
+
+
 def _batch_send(dist: Any, tensors: Sequence[Any], destination: int) -> None:
     operations = [dist.P2POp(dist.isend, tensor, destination) for tensor in tensors]
     for request in dist.batch_isend_irecv(operations):
@@ -180,6 +256,7 @@ def _route_engine(
     local_tail: tuple[Any, Any],
     config: BenchmarkConfig,
 ) -> Any:
+    state_backend = _state_backend(config)
     dist.send(query, dst=1)
     _batch_receive(dist, remote_buffers, source=1)
     states = [remote_buffers]
@@ -192,12 +269,10 @@ def _route_engine(
                 local_tail[1],
                 kv_heads=config.kv_heads,
                 scale=config.head_dim**-0.5,
-                backend=config.attention_backend,
+                backend=state_backend,
             )
         )
-    return merge_attention_states(
-        torch, states, backend=config.attention_backend
-    )[0]
+    return merge_attention_states(torch, states, backend=state_backend)[0]
 
 
 def _route_worker(
@@ -206,17 +281,27 @@ def _route_worker(
     query_buffer: Any,
     prefix: tuple[Any, Any],
     config: BenchmarkConfig,
+    paged: _PagedFixture | None,
 ) -> None:
     dist.recv(query_buffer, src=0)
-    state = compute_attention_state(
-        torch,
-        query_buffer,
-        prefix[0],
-        prefix[1],
-        kv_heads=config.kv_heads,
-        scale=config.head_dim**-0.5,
-        backend=config.attention_backend,
-    )
+    if paged is not None:
+        state = paged.executor.execute(
+            query_buffer,
+            paged.cache,
+            paged.view,
+            kv_heads=config.kv_heads,
+            scale=config.head_dim**-0.5,
+        )
+    else:
+        state = compute_attention_state(
+            torch,
+            query_buffer,
+            prefix[0],
+            prefix[1],
+            kv_heads=config.kv_heads,
+            scale=config.head_dim**-0.5,
+            backend=config.attention_backend,
+        )
     _batch_send(dist, state, destination=0)
 
 
@@ -227,8 +312,17 @@ def _stage_engine(
     receive_buffers: tuple[Any, Any],
     full_buffers: tuple[Any, Any],
     config: BenchmarkConfig,
+    paged: _PagedFixture | None,
 ) -> Any:
     _batch_receive(dist, receive_buffers, source=1)
+    if paged is not None:
+        return paged.executor.execute(
+            query,
+            paged.cache,
+            paged.view,
+            kv_heads=config.kv_heads,
+            scale=config.head_dim**-0.5,
+        )[0]
     return compute_attention_state(
         torch,
         query,
@@ -236,7 +330,7 @@ def _stage_engine(
         full_buffers[1],
         kv_heads=config.kv_heads,
         scale=config.head_dim**-0.5,
-        backend=config.attention_backend,
+        backend=_state_backend(config),
     )[0]
 
 
@@ -312,6 +406,8 @@ def _write_report(
     stage_samples: Sequence[float],
     report_path: str,
 ) -> None:
+    paged = config.attention_backend == PAGED_ATTENTION_BACKEND
+
     def correctness(output: Any) -> dict[str, Any]:
         difference = (output - expected).abs()
         return {
@@ -339,17 +435,21 @@ def _write_report(
             "transport": "torch.distributed NCCL point-to-point",
             "attention_backend": config.attention_backend,
             "attention_kernel": (
-                "FlashInfer single_decode_with_kv_cache"
+                "FlashInfer BatchDecodeWithPagedKVCacheWrapper"
+                if paged
+                else "FlashInfer single_decode_with_kv_cache"
                 if config.attention_backend == "flashinfer"
                 else "PyTorch CUDA einsum output-plus-LSE reference"
             ),
             "merge_kernel": (
                 "FlashInfer merge_states"
-                if config.attention_backend == "flashinfer"
+                if config.attention_backend in ("flashinfer", PAGED_ATTENTION_BACKEND)
                 else "PyTorch output-plus-LSE merge"
             ),
-            "kv_layout": "contiguous NHD",
-            "production_kernel": False,
+            "kv_layout": "paged NHD" if paged else "contiguous NHD",
+            "paged_executor": paged,
+            "production_kernel": paged,
+            "fixture_repacked_before_timing": paged,
         },
         "environment": _environment(torch),
         "workload": asdict(config),
@@ -392,6 +492,8 @@ def _run_rank(
         )
         prefix = (prefix_key, prefix_value)
         local_tail = (tail_key, tail_value)
+        paged_route = None
+        paged_stage = None
 
         if rank == 0:
             remote_buffers = (
@@ -421,8 +523,33 @@ def _run_rank(
             if config.tail_tokens:
                 stage_key[config.prefix_tokens :].copy_(tail_key)
                 stage_value[config.prefix_tokens :].copy_(tail_value)
+            if config.attention_backend == PAGED_ATTENTION_BACKEND:
+                paged_stage = _make_paged_fixture(
+                    torch,
+                    stage_key,
+                    stage_value,
+                    config,
+                    table_id="stage/full/layer-0",
+                )
+                paged_stage_key, paged_stage_value = paged_stage.cache
+                stage_receive_buffers = (
+                    paged_stage_key.view(
+                        -1, config.kv_heads, config.head_dim
+                    )[: config.prefix_tokens],
+                    paged_stage_value.view(
+                        -1, config.kv_heads, config.head_dim
+                    )[: config.prefix_tokens],
+                )
         else:
             query_buffer = torch.empty_like(query)
+            if config.attention_backend == PAGED_ATTENTION_BACKEND:
+                paged_route = _make_paged_fixture(
+                    torch,
+                    prefix_key,
+                    prefix_value,
+                    config,
+                    table_id="route/prefix/layer-0",
+                )
 
         dist.barrier()
         if rank == 0:
@@ -431,7 +558,7 @@ def _run_rank(
             )
             expected = _full_attention(torch, query, prefix, local_tail, config)
         else:
-            _route_worker(torch, dist, query_buffer, prefix, config)
+            _route_worker(torch, dist, query_buffer, prefix, config, paged_route)
 
         dist.barrier()
         route_samples = []
@@ -446,7 +573,9 @@ def _run_rank(
                 if iteration >= config.warmup:
                     route_samples.append(elapsed)
             else:
-                _route_worker(torch, dist, query_buffer, prefix, config)
+                _route_worker(
+                    torch, dist, query_buffer, prefix, config, paged_route
+                )
 
         dist.barrier()
         if rank == 0:
@@ -457,6 +586,7 @@ def _run_rank(
                 stage_receive_buffers,
                 stage_full_buffers,
                 config,
+                paged_stage,
             )
         else:
             _stage_worker(dist, prefix)
@@ -474,6 +604,7 @@ def _run_rank(
                         stage_receive_buffers,
                         stage_full_buffers,
                         config,
+                        paged_stage,
                     ),
                 )
                 if iteration >= config.warmup:

@@ -38,6 +38,13 @@ class TwoGpuSmokeContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported attention backend"):
             BenchmarkConfig(attention_backend="unknown").validate()
 
+    def test_accepts_paged_flashinfer_backend(self) -> None:
+        config = BenchmarkConfig(
+            attention_backend="flashinfer-paged", page_size=32
+        )
+        config.validate()
+        self.assertEqual(config.page_size, 32)
+
     def test_default_tolerance_tracks_wire_dtype(self) -> None:
         fp16 = BenchmarkConfig(dtype="float16")
         bf16 = BenchmarkConfig(dtype="bfloat16")
@@ -63,13 +70,18 @@ class TwoGpuSmokeContractTest(unittest.TestCase):
                     "--head-dim",
                     "64",
                     "--attention-backend",
-                    "flashinfer",
+                    "flashinfer-paged",
+                    "--page-size",
+                    "32",
                 ]
             )
         self.assertEqual(status, 0)
         report = json.loads(output.getvalue())
         self.assertEqual(report["workload"]["prefix_tokens"], 128)
-        self.assertEqual(report["workload"]["attention_backend"], "flashinfer")
+        self.assertEqual(
+            report["workload"]["attention_backend"], "flashinfer-paged"
+        )
+        self.assertEqual(report["workload"]["page_size"], 32)
         self.assertGreater(report["payload_bytes"]["stage_kv_total"], 0)
 
     def test_run_reports_environment_failure_as_exit_two(self) -> None:
