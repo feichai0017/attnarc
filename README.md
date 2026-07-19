@@ -33,7 +33,7 @@ never synchronously queries the global controller or Holt.
 - external `KvPool` API with object generations, ordered events, and read leases;
 - Holt-backed persistent object catalog plus worker-epoch-aware hot directory;
 - SLO cost comparison for local, route-query, KV-stage, and sharded execution;
-- exact split-KV online-softmax merge with reference correctness tests;
+- exact split-KV output-plus-LSE merge with reference correctness tests;
 - node-local single-writer step state, generation-pinned `KvView`, lease
   validation, and active-tail sealing;
 - handle-based tensor transport API with registered-region bounds checks;
@@ -50,7 +50,7 @@ never synchronously queries the global controller or Holt.
 ## Not Implemented Yet
 
 - SGLang and remote-execution attention backend adapters;
-- an executed two-GPU report and optimized CUDA partial-attention kernels;
+- an executed two-GPU report and optimized CUDA attention-state kernels;
 - production CUDA IPC, NCCL, NIXL, or GPUDirect RDMA transports;
 - a production Mooncake adapter;
 - remote GPU end-to-end latency or throughput claims.

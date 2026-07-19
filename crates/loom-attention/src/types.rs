@@ -187,7 +187,7 @@ pub struct ComputeCapabilities {
     pub dtypes: Vec<DType>,
     pub head_sizes: Vec<u32>,
     pub page_sizes: Vec<u32>,
-    pub supports_partial_softmax: bool,
+    pub supports_attention_state: bool,
     pub supports_graph_capture: bool,
 }
 

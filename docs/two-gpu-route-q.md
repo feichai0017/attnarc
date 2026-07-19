@@ -19,8 +19,8 @@ flowchart LR
     Worker["Rank 1 / GPU 1\nsealed prefix KV"]
 
     Engine -->|"Q via NCCL"| Worker
-    Worker -->|"m, l, u partials"| Engine
-    Engine --> Merge["exact online-softmax merge"]
+    Worker -->|"O + LSE state"| Engine
+    Engine --> Merge["exact attention-state merge"]
 
     Worker -. "Stage-KV baseline: K and V" .-> Engine
 ```
@@ -60,6 +60,9 @@ loom-two-gpu-smoke plan \
 The command reports tensor payload bytes only. It excludes NCCL protocol,
 launch, queueing, synchronization, and kernel costs.
 
+The default correctness tolerance follows the attention-state wire dtype:
+`2e-3` for FP16 and `2e-2` for BF16. Use `--atol` and `--rtol` to override it.
+
 ## Run
 
 ```bash
@@ -82,17 +85,18 @@ argument fixed when comparing the two paths.
 
 ## Route-Q Payload
 
-Rank 0 sends Q. Rank 1 returns three float32 tensors for each row and query
-head:
+Rank 0 sends Q. Rank 1 returns the attention output in the request dtype and
+one FP32 log-sum-exp value for each row and query head:
 
 ```text
-m = max(logits)
-l = sum(exp(logits - m))
-u = sum(exp(logits - m) * V)
+O_i = softmax(Q K_i^T) V_i
+LSE_i = log(sum(exp(Q K_i^T)))
 ```
 
-Rank 0 computes the same partial over its active tail and merges both using a
-global maximum. The returned payload is independent of historical KV length.
+Rank 0 computes the same state over its active tail and merges each segment
+with weights `exp(LSE_i - logsumexp(LSE))`. The returned payload is independent
+of historical KV length and matches the contract exposed by optimized
+attention kernels.
 
 ## Stage-KV Baseline
 

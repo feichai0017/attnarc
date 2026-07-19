@@ -18,7 +18,7 @@ flowchart TB
     Runtime --> Local["Local attention"]
     Runtime --> Transport["Tensor transport"]
     Transport --> Worker["Remote attention worker"]
-    Worker --> Merge["Exact partial-softmax merge"]
+    Worker --> Merge["Exact output-plus-LSE merge"]
     Local --> Merge
     Merge --> Output["Attention output"]
     Output --> Engine

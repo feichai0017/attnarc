@@ -47,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         dtypes: vec![DType::Fp32, DType::Fp16, DType::Bf16],
         head_sizes: vec![64, 80, 96, 128],
         page_sizes: vec![1, 16, 32],
-        supports_partial_softmax: true,
+        supports_attention_state: true,
         supports_graph_capture: false,
     };
     let app = Router::new().route("/healthz", get(health)).route(

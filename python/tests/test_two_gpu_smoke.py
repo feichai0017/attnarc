@@ -23,13 +23,22 @@ class TwoGpuSmokeContractTest(unittest.TestCase):
         )
         payload = projected_transfer_bytes(config)
         self.assertEqual(payload["query"], 8192)
-        self.assertEqual(payload["partial"], 16640)
+        self.assertEqual(payload["output"], 8192)
+        self.assertEqual(payload["logsumexp"], 128)
+        self.assertEqual(payload["attention_state"], 8320)
+        self.assertEqual(payload["route_query_total"], 16512)
         self.assertEqual(payload["stage_kv_total"], 16_777_216)
         self.assertLess(payload["route_query_total"], payload["stage_kv_total"])
 
     def test_rejects_invalid_gqa_shape(self) -> None:
         with self.assertRaisesRegex(ValueError, "kv_heads must divide query_heads"):
             BenchmarkConfig(query_heads=12, kv_heads=5).validate()
+
+    def test_default_tolerance_tracks_wire_dtype(self) -> None:
+        fp16 = BenchmarkConfig(dtype="float16")
+        bf16 = BenchmarkConfig(dtype="bfloat16")
+        self.assertEqual((fp16.atol, fp16.rtol), (2e-3, 2e-3))
+        self.assertEqual((bf16.atol, bf16.rtol), (2e-2, 2e-2))
 
     def test_percentile_interpolates_ordered_samples(self) -> None:
         self.assertEqual(percentile([4.0, 1.0, 3.0, 2.0], 0.5), 2.5)

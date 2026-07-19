@@ -1,9 +1,9 @@
 """Two-GPU NCCL acceptance harness for the Route-Q data path.
 
 The remote rank owns a sealed KV prefix. The engine rank sends only Q, receives
-online-softmax partials, merges them with a local active tail, and compares the
-result with full attention. A Stage-KV baseline transfers the remote prefix in
-the opposite direction under the same workload.
+an output-plus-LSE attention state, merges it with its local active-tail state,
+and compares the result with full attention. A Stage-KV baseline transfers the
+remote prefix in the opposite direction under the same workload.
 """
 
 from __future__ import annotations
@@ -23,6 +23,10 @@ from typing import Any, Sequence
 
 
 DTYPE_BYTES = {"float16": 2, "bfloat16": 2}
+DTYPE_TOLERANCES = {
+    "float16": (2e-3, 2e-3),
+    "bfloat16": (2e-2, 2e-2),
+}
 
 
 @dataclass(frozen=True)
@@ -37,9 +41,17 @@ class BenchmarkConfig:
     warmup: int = 5
     iterations: int = 20
     seed: int = 7
-    atol: float = 1e-4
-    rtol: float = 1e-4
+    atol: float | None = None
+    rtol: float | None = None
     timeout_seconds: int = 120
+
+    def __post_init__(self) -> None:
+        if self.dtype in DTYPE_TOLERANCES:
+            default_atol, default_rtol = DTYPE_TOLERANCES[self.dtype]
+            if self.atol is None:
+                object.__setattr__(self, "atol", default_atol)
+            if self.rtol is None:
+                object.__setattr__(self, "rtol", default_rtol)
 
     def validate(self) -> None:
         positive = {
@@ -60,6 +72,8 @@ class BenchmarkConfig:
             raise ValueError("kv_heads must divide query_heads")
         if self.dtype not in DTYPE_BYTES:
             raise ValueError(f"unsupported dtype: {self.dtype}")
+        if self.atol is None or self.rtol is None:
+            raise ValueError("atol and rtol must be configured")
         if self.atol < 0.0 or self.rtol < 0.0:
             raise ValueError("atol and rtol must be non-negative")
 
@@ -68,12 +82,9 @@ def projected_transfer_bytes(config: BenchmarkConfig) -> dict[str, int]:
     config.validate()
     element_bytes = DTYPE_BYTES[config.dtype]
     query = config.rows * config.query_heads * config.head_dim * element_bytes
-    partial = (
-        config.rows
-        * config.query_heads
-        * (2 + config.head_dim)
-        * 4
-    )
+    output = config.rows * config.query_heads * config.head_dim * element_bytes
+    logsumexp = config.rows * config.query_heads * 4
+    attention_state = output + logsumexp
     staged_kv = (
         2
         * config.prefix_tokens
@@ -83,8 +94,10 @@ def projected_transfer_bytes(config: BenchmarkConfig) -> dict[str, int]:
     )
     return {
         "query": query,
-        "partial": partial,
-        "route_query_total": query + partial,
+        "output": output,
+        "logsumexp": logsumexp,
+        "attention_state": attention_state,
+        "route_query_total": query + attention_state,
         "stage_kv_total": staged_kv,
     }
 
@@ -138,7 +151,7 @@ def _make_inputs(torch: Any, config: BenchmarkConfig, device: Any) -> tuple[Any,
     return query, prefix_key, prefix_value, tail_key, tail_value
 
 
-def _partial_attention(
+def _attention_state(
     torch: Any,
     query: Any,
     key: Any,
@@ -146,10 +159,10 @@ def _partial_attention(
     *,
     kv_heads: int,
     scale: float,
-) -> tuple[Any, Any, Any]:
+) -> tuple[Any, Any]:
     rows, query_heads, head_dim = query.shape
     if key.shape[0] == 0:
-        raise ValueError("partial attention requires at least one KV token")
+        raise ValueError("attention state requires at least one KV token")
     groups = query_heads // kv_heads
     grouped_query = query.float().reshape(rows, kv_heads, groups, head_dim)
     scores = torch.einsum("rhgd,thd->rhgt", grouped_query, key.float()) * scale
@@ -157,24 +170,29 @@ def _partial_attention(
     weights = torch.exp(scores - max_logits.unsqueeze(-1))
     exp_sums = weights.sum(dim=-1)
     weighted_values = torch.einsum("rhgt,thd->rhgd", weights, value.float())
+    output = weighted_values / exp_sums.unsqueeze(-1)
+    logsumexp = max_logits + torch.log(exp_sums)
     return (
-        max_logits.reshape(rows, query_heads).contiguous(),
-        exp_sums.reshape(rows, query_heads).contiguous(),
-        weighted_values.reshape(rows, query_heads, head_dim).contiguous(),
+        output.reshape(rows, query_heads, head_dim)
+        .to(dtype=query.dtype)
+        .contiguous(),
+        logsumexp.reshape(rows, query_heads).contiguous(),
     )
 
 
-def _merge_partials(torch: Any, partials: Sequence[tuple[Any, Any, Any]]) -> Any:
-    if not partials:
-        raise ValueError("at least one partial is required")
-    global_max = torch.stack([partial[0] for partial in partials]).amax(dim=0)
-    denominator = torch.zeros_like(partials[0][1])
-    numerator = torch.zeros_like(partials[0][2])
-    for max_logits, exp_sums, weighted_values in partials:
-        correction = torch.exp(max_logits - global_max)
-        denominator.add_(correction * exp_sums)
-        numerator.add_(correction.unsqueeze(-1) * weighted_values)
-    return numerator / denominator.unsqueeze(-1)
+def _merge_states(
+    torch: Any, states: Sequence[tuple[Any, Any]]
+) -> tuple[Any, Any]:
+    if not states:
+        raise ValueError("at least one attention state is required")
+    merged_lse = torch.logsumexp(
+        torch.stack([state[1] for state in states]), dim=0
+    )
+    merged_output = torch.zeros_like(states[0][0], dtype=torch.float32)
+    for output, logsumexp in states:
+        correction = torch.exp(logsumexp - merged_lse)
+        merged_output.add_(correction.unsqueeze(-1) * output.float())
+    return merged_output.to(dtype=states[0][0].dtype), merged_lse
 
 
 def _batch_send(dist: Any, tensors: Sequence[Any], destination: int) -> None:
@@ -193,16 +211,16 @@ def _route_engine(
     torch: Any,
     dist: Any,
     query: Any,
-    remote_buffers: tuple[Any, Any, Any],
+    remote_buffers: tuple[Any, Any],
     local_tail: tuple[Any, Any],
     config: BenchmarkConfig,
 ) -> Any:
     dist.send(query, dst=1)
     _batch_receive(dist, remote_buffers, source=1)
-    partials = [remote_buffers]
+    states = [remote_buffers]
     if config.tail_tokens:
-        partials.append(
-            _partial_attention(
+        states.append(
+            _attention_state(
                 torch,
                 query,
                 local_tail[0],
@@ -211,7 +229,7 @@ def _route_engine(
                 scale=config.head_dim**-0.5,
             )
         )
-    return _merge_partials(torch, partials)
+    return _merge_states(torch, states)[0]
 
 
 def _route_worker(
@@ -222,7 +240,7 @@ def _route_worker(
     config: BenchmarkConfig,
 ) -> None:
     dist.recv(query_buffer, src=0)
-    partial = _partial_attention(
+    state = _attention_state(
         torch,
         query_buffer,
         prefix[0],
@@ -230,7 +248,7 @@ def _route_worker(
         kv_heads=config.kv_heads,
         scale=config.head_dim**-0.5,
     )
-    _batch_send(dist, partial, destination=0)
+    _batch_send(dist, state, destination=0)
 
 
 def _stage_engine(
@@ -242,19 +260,14 @@ def _stage_engine(
     config: BenchmarkConfig,
 ) -> Any:
     _batch_receive(dist, receive_buffers, source=1)
-    return _merge_partials(
+    return _attention_state(
         torch,
-        [
-            _partial_attention(
-                torch,
-                query,
-                full_buffers[0],
-                full_buffers[1],
-                kv_heads=config.kv_heads,
-                scale=config.head_dim**-0.5,
-            )
-        ],
-    )
+        query,
+        full_buffers[0],
+        full_buffers[1],
+        kv_heads=config.kv_heads,
+        scale=config.head_dim**-0.5,
+    )[0]
 
 
 def _stage_worker(dist: Any, prefix: tuple[Any, Any]) -> None:
@@ -273,19 +286,14 @@ def _full_attention(
         value = torch.cat((prefix[1], local_tail[1]), dim=0)
     else:
         key, value = prefix
-    return _merge_partials(
+    return _attention_state(
         torch,
-        [
-            _partial_attention(
-                torch,
-                query,
-                key,
-                value,
-                kv_heads=config.kv_heads,
-                scale=config.head_dim**-0.5,
-            )
-        ],
-    )
+        query,
+        key,
+        value,
+        kv_heads=config.kv_heads,
+        scale=config.head_dim**-0.5,
+    )[0]
 
 
 def _timed_cuda(torch: Any, operation: Any) -> float:
@@ -358,7 +366,7 @@ def _write_report(
         "passed": passed,
         "implementation": {
             "transport": "torch.distributed NCCL point-to-point",
-            "attention_kernel": "PyTorch CUDA einsum online-softmax reference",
+            "attention_kernel": "PyTorch CUDA einsum output-plus-LSE reference",
             "production_kernel": False,
         },
         "environment": _environment(torch),
@@ -406,17 +414,12 @@ def _run_rank(
         if rank == 0:
             remote_buffers = (
                 torch.empty(
-                    (config.rows, config.query_heads),
-                    dtype=torch.float32,
-                    device=device,
-                ),
-                torch.empty(
-                    (config.rows, config.query_heads),
-                    dtype=torch.float32,
-                    device=device,
-                ),
-                torch.empty(
                     (config.rows, config.query_heads, config.head_dim),
+                    dtype=query.dtype,
+                    device=device,
+                ),
+                torch.empty(
+                    (config.rows, config.query_heads),
                     dtype=torch.float32,
                     device=device,
                 ),
@@ -562,8 +565,8 @@ def _add_workload_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument("--atol", type=float, default=1e-4)
-    parser.add_argument("--rtol", type=float, default=1e-4)
+    parser.add_argument("--atol", type=float)
+    parser.add_argument("--rtol", type=float)
     parser.add_argument("--timeout-seconds", type=int, default=120)
 
 

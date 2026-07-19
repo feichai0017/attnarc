@@ -137,37 +137,41 @@ impl AttentionOp {
     }
 }
 
+/// Mergeable attention state for one KV segment.
+///
+/// This matches the output-plus-LSE contract exposed by production attention
+/// kernels such as FlashInfer. `output` is row-major `[rows, value_dim]` and
+/// `logsumexp` contains one FP32 value per row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SoftmaxStats {
-    /// Number of independent query rows represented by this partial result.
+pub struct AttentionState {
     pub rows: usize,
     pub value_dim: usize,
-    pub max_logits: Vec<f32>,
-    pub exp_sums: Vec<f32>,
-    /// Unnormalized weighted values, row-major `[rows, value_dim]`.
-    pub weighted_values: Vec<f32>,
+    pub output: Vec<f32>,
+    pub logsumexp: Vec<f32>,
 }
 
-impl SoftmaxStats {
+impl AttentionState {
     pub fn validate(&self) -> Result<(), AttentionError> {
         if self.rows == 0 || self.value_dim == 0 {
             return Err(AttentionError::InvalidShape(
                 "rows and value_dim must be non-zero".into(),
             ));
         }
-        if self.max_logits.len() != self.rows || self.exp_sums.len() != self.rows {
+        if self.logsumexp.len() != self.rows {
             return Err(AttentionError::InvalidShape(
-                "one max and exp sum are required per row".into(),
+                "one logsumexp value is required per row".into(),
             ));
         }
-        if self.weighted_values.len() != self.rows * self.value_dim {
+        if self.output.len() != self.rows * self.value_dim {
             return Err(AttentionError::InvalidShape(
-                "weighted value shape does not match rows * value_dim".into(),
+                "attention output shape does not match rows * value_dim".into(),
             ));
         }
-        if self.exp_sums.iter().any(|sum| *sum <= 0.0) {
+        if self.logsumexp.iter().any(|value| !value.is_finite())
+            || self.output.iter().any(|value| !value.is_finite())
+        {
             return Err(AttentionError::InvalidShape(
-                "partial exp sums must be positive".into(),
+                "attention state values must be finite".into(),
             ));
         }
         Ok(())
@@ -179,7 +183,8 @@ pub struct AttentionCompletion {
     pub completion_id: String,
     pub executor: WorkerId,
     pub output: TensorHandle,
-    pub stats: Option<TensorHandle>,
+    /// FP32 `[rows, heads]` LSE tensor when this result will be merged.
+    pub logsumexp: Option<TensorHandle>,
 }
 
 pub trait AttentionExecutor: std::fmt::Debug + Send + Sync {
@@ -193,15 +198,15 @@ pub trait AttentionExecutor: std::fmt::Debug + Send + Sync {
     ) -> Result<AttentionCompletion, AttentionError>;
 }
 
-/// Merge exact online-softmax statistics from disjoint KV shards.
-pub fn merge_softmax_partials(partials: &[SoftmaxStats]) -> Result<Vec<f32>, AttentionError> {
-    let first = partials
+/// Merge attention states from disjoint KV segments without approximation.
+pub fn merge_attention_states(states: &[AttentionState]) -> Result<AttentionState, AttentionError> {
+    let first = states
         .first()
         .ok_or_else(|| AttentionError::InvalidShape("at least one shard is required".into()))?;
     first.validate()?;
-    for partial in &partials[1..] {
-        partial.validate()?;
-        if partial.rows != first.rows || partial.value_dim != first.value_dim {
+    for state in &states[1..] {
+        state.validate()?;
+        if state.rows != first.rows || state.value_dim != first.value_dim {
             return Err(AttentionError::InvalidShape(
                 "all shards must have the same row and value dimensions".into(),
             ));
@@ -209,43 +214,50 @@ pub fn merge_softmax_partials(partials: &[SoftmaxStats]) -> Result<Vec<f32>, Att
     }
 
     let mut output = vec![0.0_f32; first.rows * first.value_dim];
+    let mut logsumexp = vec![0.0_f32; first.rows];
     for row in 0..first.rows {
-        let global_max = partials
+        let max_lse = states
             .iter()
-            .map(|partial| partial.max_logits[row])
+            .map(|state| state.logsumexp[row])
             .fold(f32::NEG_INFINITY, f32::max);
-        let denominator: f32 = partials
+        let normalizer: f32 = states
             .iter()
-            .map(|partial| (partial.max_logits[row] - global_max).exp() * partial.exp_sums[row])
+            .map(|state| (state.logsumexp[row] - max_lse).exp())
             .sum();
-        if !denominator.is_finite() || denominator <= 0.0 {
+        if !normalizer.is_finite() || normalizer <= 0.0 {
             return Err(AttentionError::Execution(
                 "merged softmax denominator is not finite and positive".into(),
             ));
         }
+        let merged_lse = max_lse + normalizer.ln();
+        logsumexp[row] = merged_lse;
         for value_index in 0..first.value_dim {
-            let numerator: f32 = partials
+            output[row * first.value_dim + value_index] = states
                 .iter()
-                .map(|partial| {
-                    let weight = (partial.max_logits[row] - global_max).exp();
-                    weight * partial.weighted_values[row * first.value_dim + value_index]
+                .map(|state| {
+                    let weight = (state.logsumexp[row] - merged_lse).exp();
+                    weight * state.output[row * first.value_dim + value_index]
                 })
                 .sum();
-            output[row * first.value_dim + value_index] = numerator / denominator;
         }
     }
-    Ok(output)
+    Ok(AttentionState {
+        rows: first.rows,
+        value_dim: first.value_dim,
+        output,
+        logsumexp,
+    })
 }
 
 /// One-query reference implementation for a single KV shard.
-pub fn reference_partial_attention(
+pub fn reference_attention_state(
     query: &[f32],
     keys: &[f32],
     values: &[f32],
     tokens: usize,
     value_dim: usize,
     scale: f32,
-) -> Result<SoftmaxStats, AttentionError> {
+) -> Result<AttentionState, AttentionError> {
     if tokens == 0 || query.is_empty() || value_dim == 0 {
         return Err(AttentionError::InvalidShape(
             "query, tokens, and value_dim must be non-zero".into(),
@@ -267,19 +279,21 @@ pub fn reference_partial_attention(
         .map(|logit| (*logit - max_logit).exp())
         .collect();
     let exp_sum: f32 = weights.iter().sum();
-    let mut weighted_values = vec![0.0_f32; value_dim];
+    let mut output = vec![0.0_f32; value_dim];
     for (token, value) in values.chunks_exact(value_dim).enumerate() {
-        for (out, element) in weighted_values.iter_mut().zip(value) {
+        for (out, element) in output.iter_mut().zip(value) {
             *out += weights[token] * element;
         }
     }
+    for element in &mut output {
+        *element /= exp_sum;
+    }
 
-    Ok(SoftmaxStats {
+    Ok(AttentionState {
         rows: 1,
         value_dim,
-        max_logits: vec![max_logit],
-        exp_sums: vec![exp_sum],
-        weighted_values,
+        output,
+        logsumexp: vec![max_logit + exp_sum.ln()],
     })
 }
 
@@ -358,15 +372,15 @@ mod tests {
         let keys = [1.0, 0.0, 0.0, 1.0, 1.0, 1.0, -1.0, 0.5];
         let values = [1.0, 2.0, 3.0, 4.0, -2.0, 1.0, 0.5, -1.0];
 
-        let full = reference_partial_attention(&query, &keys, &values, 4, 2, 1.0).unwrap();
-        let expected = merge_softmax_partials(&[full]).unwrap();
+        let expected = reference_attention_state(&query, &keys, &values, 4, 2, 1.0).unwrap();
 
         let shard_a =
-            reference_partial_attention(&query, &keys[..4], &values[..4], 2, 2, 1.0).unwrap();
+            reference_attention_state(&query, &keys[..4], &values[..4], 2, 2, 1.0).unwrap();
         let shard_b =
-            reference_partial_attention(&query, &keys[4..], &values[4..], 2, 2, 1.0).unwrap();
-        let distributed = merge_softmax_partials(&[shard_a, shard_b]).unwrap();
-        close(&expected, &distributed);
+            reference_attention_state(&query, &keys[4..], &values[4..], 2, 2, 1.0).unwrap();
+        let distributed = merge_attention_states(&[shard_a, shard_b]).unwrap();
+        close(&expected.output, &distributed.output);
+        close(&expected.logsumexp, &distributed.logsumexp);
     }
 
     #[test]
@@ -385,20 +399,18 @@ mod tests {
 
     #[test]
     fn merge_rejects_incompatible_shards() {
-        let good = SoftmaxStats {
+        let good = AttentionState {
             rows: 1,
             value_dim: 2,
-            max_logits: vec![0.0],
-            exp_sums: vec![1.0],
-            weighted_values: vec![1.0, 2.0],
+            output: vec![1.0, 2.0],
+            logsumexp: vec![0.0],
         };
-        let bad = SoftmaxStats {
+        let bad = AttentionState {
             rows: 1,
             value_dim: 1,
-            max_logits: vec![0.0],
-            exp_sums: vec![1.0],
-            weighted_values: vec![1.0],
+            output: vec![1.0],
+            logsumexp: vec![0.0],
         };
-        assert!(merge_softmax_partials(&[good, bad]).is_err());
+        assert!(merge_attention_states(&[good, bad]).is_err());
     }
 }
