@@ -13,6 +13,7 @@ dependencies = []
 [project.optional-dependencies]
 vllm = ["vllm>=0.25,<0.26"]
 cuda = ["torch>=2.4"]
+flashinfer = ["torch>=2.4", "flashinfer-python>=0.6,<0.7"]
 
 [project.entry-points."vllm.general_plugins"]
 loom = "loom_attention.vllm_plugin:register"

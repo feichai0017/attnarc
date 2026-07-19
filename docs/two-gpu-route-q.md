@@ -37,6 +37,12 @@ Use a CUDA-enabled PyTorch build with NCCL and two visible devices:
 python3 -m pip install -e './python[cuda]'
 ```
 
+To run the optimized contiguous-KV kernel path, install the FlashInfer extra:
+
+```bash
+python3 -m pip install -e './python[flashinfer]'
+```
+
 When running inside the vLLM environment, its existing compatible PyTorch
 installation is sufficient:
 
@@ -75,6 +81,7 @@ loom-two-gpu-smoke run \
   --kv-heads 8 \
   --head-dim 128 \
   --dtype float16 \
+  --attention-backend flashinfer \
   --warmup 10 \
   --iterations 100 \
   --report build/two-gpu-smoke/report-4k.json
@@ -123,3 +130,10 @@ A reviewable report must contain:
 
 The current macOS development host cannot produce this report. M2a remains open
 until the harness runs on a Linux CUDA machine with two GPUs.
+
+`--attention-backend reference` uses the PyTorch oracle for every path.
+`--attention-backend flashinfer` uses FlashInfer
+`single_decode_with_kv_cache(..., return_lse=True)` and `merge_states` for the
+measured paths, while full attention remains the independent PyTorch oracle.
+This backend still receives contiguous NHD KV; the paged external-pool executor
+remains a separate milestone.

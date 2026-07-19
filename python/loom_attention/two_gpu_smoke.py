@@ -23,6 +23,7 @@ from typing import Any, Sequence
 
 
 DTYPE_BYTES = {"float16": 2, "bfloat16": 2}
+ATTENTION_BACKENDS = ("flashinfer", "reference")
 DTYPE_TOLERANCES = {
     "float16": (2e-3, 2e-3),
     "bfloat16": (2e-2, 2e-2),
@@ -38,6 +39,7 @@ class BenchmarkConfig:
     kv_heads: int = 8
     head_dim: int = 128
     dtype: str = "float16"
+    attention_backend: str = "reference"
     warmup: int = 5
     iterations: int = 20
     seed: int = 7
@@ -72,6 +74,10 @@ class BenchmarkConfig:
             raise ValueError("kv_heads must divide query_heads")
         if self.dtype not in DTYPE_BYTES:
             raise ValueError(f"unsupported dtype: {self.dtype}")
+        if self.attention_backend not in ATTENTION_BACKENDS:
+            raise ValueError(
+                f"unsupported attention backend: {self.attention_backend}"
+            )
         if self.atol is None or self.rtol is None:
             raise ValueError("atol and rtol must be configured")
         if self.atol < 0.0 or self.rtol < 0.0:
@@ -151,6 +157,45 @@ def _make_inputs(torch: Any, config: BenchmarkConfig, device: Any) -> tuple[Any,
     return query, prefix_key, prefix_value, tail_key, tail_value
 
 
+def _load_flashinfer() -> Any:
+    try:
+        import flashinfer
+    except ImportError as error:
+        raise RuntimeError(
+            "FlashInfer backend requested; install './python[flashinfer]'"
+        ) from error
+    return flashinfer
+
+
+def _flashinfer_attention_state(
+    torch: Any,
+    query: Any,
+    key: Any,
+    value: Any,
+    *,
+    scale: float,
+) -> tuple[Any, Any]:
+    flashinfer = _load_flashinfer()
+    outputs = []
+    logsumexp = []
+    for row in query:
+        output, row_lse = flashinfer.single_decode_with_kv_cache(
+            row.contiguous(),
+            key,
+            value,
+            kv_layout="NHD",
+            pos_encoding_mode="NONE",
+            sm_scale=scale,
+            return_lse=True,
+        )
+        outputs.append(output)
+        logsumexp.append(row_lse)
+    return (
+        torch.stack(outputs).contiguous(),
+        torch.stack(logsumexp).float().contiguous(),
+    )
+
+
 def _attention_state(
     torch: Any,
     query: Any,
@@ -159,7 +204,18 @@ def _attention_state(
     *,
     kv_heads: int,
     scale: float,
+    backend: str,
 ) -> tuple[Any, Any]:
+    if backend == "flashinfer":
+        return _flashinfer_attention_state(
+            torch,
+            query,
+            key,
+            value,
+            scale=scale,
+        )
+    if backend != "reference":
+        raise ValueError(f"unsupported attention backend: {backend}")
     rows, query_heads, head_dim = query.shape
     if key.shape[0] == 0:
         raise ValueError("attention state requires at least one KV token")
@@ -181,10 +237,22 @@ def _attention_state(
 
 
 def _merge_states(
-    torch: Any, states: Sequence[tuple[Any, Any]]
+    torch: Any,
+    states: Sequence[tuple[Any, Any]],
+    *,
+    backend: str,
 ) -> tuple[Any, Any]:
     if not states:
         raise ValueError("at least one attention state is required")
+    if backend == "flashinfer":
+        flashinfer = _load_flashinfer()
+        output, logsumexp = flashinfer.merge_states(
+            torch.stack([state[0] for state in states], dim=1),
+            torch.stack([state[1] for state in states], dim=1).float(),
+        )
+        return output.contiguous(), logsumexp.contiguous()
+    if backend != "reference":
+        raise ValueError(f"unsupported attention backend: {backend}")
     merged_lse = torch.logsumexp(
         torch.stack([state[1] for state in states]), dim=0
     )
@@ -227,9 +295,12 @@ def _route_engine(
                 local_tail[1],
                 kv_heads=config.kv_heads,
                 scale=config.head_dim**-0.5,
+                backend=config.attention_backend,
             )
         )
-    return _merge_states(torch, states)[0]
+    return _merge_states(
+        torch, states, backend=config.attention_backend
+    )[0]
 
 
 def _route_worker(
@@ -247,6 +318,7 @@ def _route_worker(
         prefix[1],
         kv_heads=config.kv_heads,
         scale=config.head_dim**-0.5,
+        backend=config.attention_backend,
     )
     _batch_send(dist, state, destination=0)
 
@@ -267,6 +339,7 @@ def _stage_engine(
         full_buffers[1],
         kv_heads=config.kv_heads,
         scale=config.head_dim**-0.5,
+        backend=config.attention_backend,
     )[0]
 
 
@@ -293,6 +366,7 @@ def _full_attention(
         value,
         kv_heads=config.kv_heads,
         scale=config.head_dim**-0.5,
+        backend="reference",
     )[0]
 
 
@@ -366,7 +440,18 @@ def _write_report(
         "passed": passed,
         "implementation": {
             "transport": "torch.distributed NCCL point-to-point",
-            "attention_kernel": "PyTorch CUDA einsum output-plus-LSE reference",
+            "attention_backend": config.attention_backend,
+            "attention_kernel": (
+                "FlashInfer single_decode_with_kv_cache"
+                if config.attention_backend == "flashinfer"
+                else "PyTorch CUDA einsum output-plus-LSE reference"
+            ),
+            "merge_kernel": (
+                "FlashInfer merge_states"
+                if config.attention_backend == "flashinfer"
+                else "PyTorch output-plus-LSE merge"
+            ),
+            "kv_layout": "contiguous NHD",
             "production_kernel": False,
         },
         "environment": _environment(torch),
@@ -562,6 +647,11 @@ def _add_workload_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--kv-heads", type=int, default=8)
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--dtype", choices=sorted(DTYPE_BYTES), default="float16")
+    parser.add_argument(
+        "--attention-backend",
+        choices=ATTENTION_BACKENDS,
+        default="reference",
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--seed", type=int, default=7)
@@ -579,6 +669,7 @@ def _config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
         kv_heads=args.kv_heads,
         head_dim=args.head_dim,
         dtype=args.dtype,
+        attention_backend=args.attention_backend,
         warmup=args.warmup,
         iterations=args.iterations,
         seed=args.seed,

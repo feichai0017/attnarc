@@ -46,11 +46,13 @@ never synchronously queries the global controller or Holt.
   Loom delegate using exact token IDs and sampled-logprob tolerance.
 - two-GPU NCCL harness for Q-only remote-prefix execution, exact local-tail
   merge, and a Stage-KV payload/latency baseline.
+- optional FlashInfer decode and cascade-merge kernels over contiguous NHD KV,
+  with the PyTorch implementation retained as the correctness oracle.
 
 ## Not Implemented Yet
 
 - SGLang and remote-execution attention backend adapters;
-- an executed two-GPU report and optimized CUDA attention-state kernels;
+- an executed two-GPU FlashInfer report and a paged-KV executor;
 - production CUDA IPC, NCCL, NIXL, or GPUDirect RDMA transports;
 - a production Mooncake adapter;
 - remote GPU end-to-end latency or throughput claims.
@@ -77,6 +79,7 @@ two NVIDIA GPUs:
 loom-two-gpu-smoke plan --prefix-tokens 4096
 loom-two-gpu-smoke run \
   --prefix-tokens 4096 \
+  --attention-backend flashinfer \
   --report build/two-gpu-smoke/report.json
 ```
 

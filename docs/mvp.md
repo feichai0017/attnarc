@@ -52,10 +52,12 @@ The same processes then run a Stage-KV baseline that sends prefix K/V from rank
 1 to rank 0. The JSON report records p50/p99 latency, payload bytes, GPU/NCCL
 versions, peer-access capability, workload shape, and correctness error.
 
-The harness performs real CUDA computation and NCCL transfers, but its
-attention kernel is a PyTorch `einsum` output-plus-LSE reference. It validates
-the protocol and performance crossover, not production kernel throughput. M2b
-replaces that executor with a paged FlashInfer or native vLLM kernel.
+The harness performs real CUDA computation and NCCL transfers. Its default
+attention kernel is a PyTorch `einsum` output-plus-LSE reference; an optional
+FlashInfer path runs `single_decode_with_kv_cache` and `merge_states` against
+the same independent reference. The FlashInfer path currently consumes
+contiguous NHD KV, so M2b remains open until a paged executor is integrated and
+measured.
 
 ## Correctness Gate
 
